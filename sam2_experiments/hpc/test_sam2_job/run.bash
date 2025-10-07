@@ -8,7 +8,7 @@
 #SBATCH --mail-type=all              # Send mail when job begins and ends
 
 #SBATCH -p scc-gpu            # The partition
-#SBATCH -G V100:1            # Number of GPUs
+#SBATCH -G V100           # Number of GPUs
 
 module load miniforge3
 module load gcc
