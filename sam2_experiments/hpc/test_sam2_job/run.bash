@@ -7,6 +7,7 @@
 #SBATCH -t 00:05:00                  # Estimated time, adapt to your needs
 #SBATCH --mail-type=all              # Send mail when job begins and ends
 
+#SBATCH --partition=scc-gpu        # Partition (queue) name
 #SBATCH --gres=gpu:1         # The partition
 
 module load miniforge3
