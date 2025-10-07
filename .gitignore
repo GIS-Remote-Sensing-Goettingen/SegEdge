@@ -7,3 +7,5 @@ gen
 *.tif
 *.png
 /chekpoints
+/{HOME}
+/sam2
