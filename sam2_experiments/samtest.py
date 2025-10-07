@@ -2,7 +2,7 @@ import rasterio, numpy as np, torch
 from PIL import Image
 from transformers import pipeline
 
-src = "./images/1084-1393.tif"; out = "fields_mask.tif"
+src = "../images/1084-1393.tif"; out = "fields_mask.tif"
 
 with rasterio.open(src) as ds:
     rgb = ds.read([1,2,3]).astype("uint8"); H, W = ds.height, ds.width

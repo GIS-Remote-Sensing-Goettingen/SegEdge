@@ -17,13 +17,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input",
         type=Path,
-        default=Path("images/1084-1389.tif"),
+        default=Path("../images/1084-1389.tif"),
         help="Path to the multispectral GeoTIFF to segment.",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("outputs"),
+        default=Path("../outputs"),
         help="Directory where the mask and overlay will be written.",
     )
     parser.add_argument(
