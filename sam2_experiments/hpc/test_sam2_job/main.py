@@ -10,6 +10,18 @@ from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
 
+
+
+def print_vram_usage(device=0):
+    torch.cuda.synchronize(device)
+    alloc = torch.cuda.memory_allocated(device)
+    reserved = torch.cuda.memory_reserved(device)
+    free, total = torch.cuda.mem_get_info(device)
+    peak = torch.cuda.max_memory_allocated(device)
+    print(f"[VRAM] allocated: {alloc/1024**2:.2f} MiB, reserved: {reserved/1024**2:.2f} MiB, free: {free/1024**2:.2f} MiB, total: {total/1024**2:.2f} MiB, peak: {peak/1024**2:.2f} MiB")
+
+
+
 def plot_images_and_save(images, grid_size, titles, save_path):
     print("[DEBUG] plot_images_and_save called")
     print("  grid_size:", grid_size)
@@ -39,6 +51,9 @@ def plot_images_and_save(images, grid_size, titles, save_path):
     dt = time.time() - t0
     print(f"[DEBUG] Saved grid image to {save_path} in {dt:.3f}s")
 
+
+
+
 if __name__ == '__main__':
     print("[INFO] Starting script")
     t_start = time.time()
@@ -53,6 +68,7 @@ if __name__ == '__main__':
 
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print("[INFO] Device:", DEVICE)
+    print_vram_usage()
 
     CHECKPOINT = "/user/davide.mattioli/u20330/SegEdge/sam2_experiments/Models/sam2_hiera_large.pt"
     CONFIG = "sam2_hiera_l.yaml"
@@ -73,8 +89,8 @@ if __name__ == '__main__':
     print("[INFO] Generating masks")
     mask_generator_2 = SAM2AutomaticMaskGenerator(
         model=sam2_model,
-        points_per_side=64,
-        points_per_batch=32,
+        points_per_side=256,
+        points_per_batch=128,
         pred_iou_thresh=0.3,
         stability_score_thresh=0.92,
         stability_score_offset=0.7,
@@ -92,6 +108,7 @@ if __name__ == '__main__':
     detections = sv.Detections.from_sam(sam_result=sam2_result_2)
     annotated_image = mask_annotator.annotate(scene=image_bgr.copy(), detections=detections)
     print("[DEBUG] annotated_image shape:", annotated_image.shape if hasattr(annotated_image, "shape") else type(annotated_image))
+    print_vram_usage()
 
     print("[INFO] Calling plot_images_and_save ...")
     plot_images_and_save(
