@@ -78,7 +78,7 @@ if __name__ == '__main__':
     print("[INFO] Instantiating mask generator")
     mask_generator = SAM2AutomaticMaskGenerator(sam2_model)
 
-    IMAGE_PATH = "/user/davide.mattioli/u20330/SegEdge/sam2_experiments/Images/super_small_sa.jpg"
+    IMAGE_PATH = "/user/davide.mattioli/u20330/SegEdge/sam2_experiments/Images/S2L2Ax10_T32UNC-6bd2a7faa-20250813_TCI.jpg"
     print("[INFO] Reading image from", IMAGE_PATH)
     image_bgr = cv2.imread(IMAGE_PATH)
     if image_bgr is None:
