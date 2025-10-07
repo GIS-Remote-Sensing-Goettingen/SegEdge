@@ -54,7 +54,7 @@ if __name__ == '__main__':
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print("[INFO] Device:", DEVICE)
 
-    CHECKPOINT = "/user/.../sam2_hiera_large.pt"
+    CHECKPOINT = "/user/davide.mattioli/u20330/SegEdge/sam2_experiments/Models/sam2_hiera_large.pt"
     CONFIG = "sam2_hiera_l.yaml"
     print("[INFO] Building SAM2 model")
     sam2_model = build_sam2(CONFIG, CHECKPOINT, device=DEVICE, apply_postprocessing=False)
@@ -62,7 +62,7 @@ if __name__ == '__main__':
     print("[INFO] Instantiating mask generator")
     mask_generator = SAM2AutomaticMaskGenerator(sam2_model)
 
-    IMAGE_PATH = "/user/.../super_small_sa.jpg"
+    IMAGE_PATH = "/user/davide.mattioli/u20330/SegEdge/sam2_experiments/Images/super_small_sa.jpg"
     print("[INFO] Reading image from", IMAGE_PATH)
     image_bgr = cv2.imread(IMAGE_PATH)
     if image_bgr is None:
