@@ -12,7 +12,9 @@
 module load miniforge3
 module load gcc
 module load cuda
-source activate
+source activate /mnt/vast-standard/home/davide.mattioli/u20330/all
+
+nvidia-smi
 
 # Print out some info.
 echo "Submitting job with sbatch from directory: ${SLURM_SUBMIT_DIR}"
