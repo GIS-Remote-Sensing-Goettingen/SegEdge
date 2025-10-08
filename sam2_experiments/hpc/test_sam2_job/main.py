@@ -4,7 +4,6 @@ import cv2
 import torch
 import numpy as np
 import supervision as sv
-import copy
 import gc
 
 from sam2.build_sam import build_sam2
@@ -52,72 +51,121 @@ def generate_patches(image, patch_size=1024, overlap=128):
     return patches
 
 
-def merge_masks(all_masks, image_shape, overlap=128):
+def process_patches_to_labelmap(patches, mask_generator, image_shape, overlap=128):
     """
-    Merge masks from overlapping patches with NMS in overlap regions.
+    Process patches and build a single label map incrementally.
+    This avoids creating full-image arrays for each mask.
 
     Args:
-        all_masks: List of mask dicts with 'segmentation', 'bbox', 'offset_x', 'offset_y'
+        patches: List of (patch, x_offset, y_offset) tuples
+        mask_generator: SAM2AutomaticMaskGenerator instance
         image_shape: (H, W) of original image
-        overlap: Overlap size
+        overlap: Overlap size for overlap region handling
 
     Returns:
-        Merged list of masks
+        labels: H×W int32 array where each pixel has a unique mask ID (0=background)
     """
-    print(f"[INFO] Merging {len(all_masks)} masks from patches")
+    H, W = image_shape
+    labels = np.zeros((H, W), dtype=np.int32)
+    next_id = 1
 
-    # Translate mask coordinates to global image space
-    global_masks = []
-    for mask_dict in all_masks:
-        mask = copy.deepcopy(mask_dict)
-        offset_x = mask.pop('offset_x', 0)
-        offset_y = mask.pop('offset_y', 0)
+    print(f"[INFO] Processing {len(patches)} patches into label map")
 
-        # Adjust bbox
-        x, y, w, h = mask['bbox']
-        mask['bbox'] = [x + offset_x, y + offset_y, w, h]
+    for idx, (patch_rgb, ox, oy) in enumerate(patches):
+        print(f"[INFO] Processing patch {idx + 1}/{len(patches)} at offset ({ox}, {oy})")
+        t_patch = time.time()
 
-        # Create full-size segmentation mask
-        full_seg = np.zeros(image_shape, dtype=bool)
-        seg = mask['segmentation']
-        y_end = min(offset_y + seg.shape[0], image_shape[0])
-        x_end = min(offset_x + seg.shape[1], image_shape[1])
-        full_seg[offset_y:y_end, offset_x:x_end] = seg[:y_end - offset_y, :x_end - offset_x]
-        mask['segmentation'] = full_seg
+        # Use scoped inference_mode + autocast per patch to prevent fragmentation
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+            patch_masks = mask_generator.generate(patch_rgb)
 
-        global_masks.append(mask)
+        print(f"[DEBUG] Patch {idx + 1} generated {len(patch_masks)} masks in {time.time() - t_patch:.2f}s")
 
-    # Simple deduplication: remove masks with high IoU in overlap regions
-    if len(global_masks) > 1:
-        keep = []
-        for i, mask in enumerate(global_masks):
-            should_keep = True
-            for kept_mask in keep:
-                intersection = np.logical_and(mask['segmentation'], kept_mask['segmentation']).sum()
-                union = np.logical_or(mask['segmentation'], kept_mask['segmentation']).sum()
-                iou = intersection / union if union > 0 else 0
+        # Sort by area (small first) so tiny regions aren't overpainted by large ones
+        patch_masks.sort(key=lambda m: m.get("area", 0))
 
-                if iou > 0.5:  # Duplicate threshold
-                    should_keep = False
-                    break
+        painted_count = 0
+        for m in patch_masks:
+            seg = m["segmentation"].astype(bool)  # (ph, pw)
+            ph, pw = seg.shape
 
-            if should_keep:
-                keep.append(mask)
+            # Calculate bounds in global image space
+            y0, y1 = oy, min(oy + ph, H)
+            x0, x1 = ox, min(ox + pw, W)
+            seg_crop = seg[:y1 - y0, :x1 - x0]
 
-        print(f"[INFO] Kept {len(keep)}/{len(global_masks)} masks after deduplication")
-        return keep
+            # Paint only where label==0 (no overlap, first-come-first-served)
+            # For overlap regions, you could add IoU check here if needed
+            paint_region = labels[y0:y1, x0:x1]
+            paint_mask = (paint_region == 0) & seg_crop
 
-    return global_masks
+            if paint_mask.any():
+                paint_region[paint_mask] = next_id
+                next_id += 1
+                painted_count += 1
+
+        print(f"[DEBUG] Painted {painted_count}/{len(patch_masks)} masks from patch {idx + 1}")
+
+        print_vram_usage()
+
+        # Free memory immediately after each patch
+        del patch_masks
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+        # Periodic garbage collection
+        if (idx + 1) % 5 == 0:
+            gc.collect()
+            print(f"[INFO] Memory cleanup after patch {idx + 1}")
+
+    unique_labels = np.unique(labels)
+    print(f"[INFO] Label map complete: {len(unique_labels) - 1} unique masks (excluding background)")
+    return labels
+
+
+def labelmap_to_colored_mask(labels, image_bgr):
+    """
+    Convert label map to a colored visualization overlay.
+
+    Args:
+        labels: H×W int32 label map
+        image_bgr: Original BGR image
+
+    Returns:
+        Annotated BGR image with colored masks
+    """
+    print("[INFO] Creating colored visualization from label map")
+
+    # Create a color map
+    num_labels = labels.max()
+    if num_labels == 0:
+        print("[WARN] No masks found in label map")
+        return image_bgr.copy()
+
+    # Generate random colors for each label
+    np.random.seed(42)  # For reproducibility
+    colors = np.random.randint(0, 255, size=(num_labels + 1, 3), dtype=np.uint8)
+    colors[0] = [0, 0, 0]  # Background is black
+
+    # Create colored mask
+    colored_mask = colors[labels]
+
+    # Blend with original image
+    alpha = 0.5
+    annotated = cv2.addWeighted(image_bgr, 1 - alpha, colored_mask, alpha, 0)
+
+    return annotated
 
 
 def print_vram_usage(device=0):
+    if not torch.cuda.is_available():
+        return
     torch.cuda.synchronize(device)
     alloc = torch.cuda.memory_allocated(device)
     reserved = torch.cuda.memory_reserved(device)
     free, total = torch.cuda.mem_get_info(device)
     peak = torch.cuda.max_memory_allocated(device)
     print(f"[VRAM] allocated: {alloc/1024**2:.2f} MiB, reserved: {reserved/1024**2:.2f} MiB, free: {free/1024**2:.2f} MiB, total: {total/1024**2:.2f} MiB, peak: {peak/1024**2:.2f} MiB")
-
 
 
 def plot_images_and_save(images, grid_size, titles, save_path):
@@ -153,8 +201,8 @@ def plot_images_and_save(images, grid_size, titles, save_path):
 if __name__ == '__main__':
     print("[INFO] Starting script")
     t_start = time.time()
-    torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
 
+    # GPU setup - but DO NOT enter global autocast context
     if torch.cuda.is_available():
         props = torch.cuda.get_device_properties(0)
         print("[INFO] GPU device properties:", props)
@@ -175,11 +223,11 @@ if __name__ == '__main__':
     mask_generator_2 = SAM2AutomaticMaskGenerator(
         model=sam2_model,
         points_per_side=64,
-        points_per_batch=64,
+        points_per_batch=32,  # Reduced from 64 to lower peak VRAM
         pred_iou_thresh=0.5,
         stability_score_thresh=0.92,
         stability_score_offset=0.7,
-        crop_n_layers=1,
+        crop_n_layers=0,  # Set to 0 since we're already tiling
         box_nms_thresh=0.7,
         min_mask_region_area=1000
     )
@@ -197,35 +245,18 @@ if __name__ == '__main__':
     OVERLAP = 128
     patches = generate_patches(image_rgb, patch_size=PATCH_SIZE, overlap=OVERLAP)
 
-    # Process each patch
-    all_masks = []
-    for idx, (patch_rgb, offset_x, offset_y) in enumerate(patches):
-        print(f"[INFO] Processing patch {idx + 1}/{len(patches)} at offset ({offset_x}, {offset_y})")
-        t_patch = time.time()
+    # Process patches into a single label map (avoids RAM blow-up)
+    labels = process_patches_to_labelmap(
+        patches,
+        mask_generator_2,
+        image_shape=image_rgb.shape[:2],
+        overlap=OVERLAP
+    )
 
-        patch_masks = mask_generator_2.generate(patch_rgb)
-
-        # Add offset information to each mask
-        for mask in patch_masks:
-            mask['offset_x'] = offset_x
-            mask['offset_y'] = offset_y
-
-        all_masks.extend(patch_masks)
-        print(f"[DEBUG] Patch {idx + 1} generated {len(patch_masks)} masks in {time.time() - t_patch:.2f}s")
-
-        # Clear cache periodically
-        if (idx + 1) % 5 == 0:
-            torch.cuda.empty_cache()
-            gc.collect()
-
-    # Merge masks
-    merged_masks = merge_masks(all_masks, image_shape=image_rgb.shape[:2], overlap=OVERLAP)
-
-    print("[INFO] Annotating image with merged masks")
-    mask_annotator = sv.MaskAnnotator(color_lookup=sv.ColorLookup.INDEX)
-    detections = sv.Detections.from_sam(sam_result=merged_masks)
-    annotated_image = mask_annotator.annotate(scene=image_bgr.copy(), detections=detections)
     print_vram_usage()
+
+    # Create colored visualization from label map
+    annotated_image = labelmap_to_colored_mask(labels, image_bgr)
 
     print("[INFO] Calling plot_images_and_save ...")
     plot_images_and_save(
@@ -235,4 +266,8 @@ if __name__ == '__main__':
         save_path="my_grid.png"
     )
 
+    # Optionally save the label map as a GeoTIFF if needed
+    # cv2.imwrite("labels.tif", labels.astype(np.uint16))
+
     print("[INFO] Total script time:", time.time() - t_start, "s")
+    print_vram_usage()
