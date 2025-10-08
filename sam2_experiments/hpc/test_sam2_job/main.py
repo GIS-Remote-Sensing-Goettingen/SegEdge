@@ -11,6 +11,101 @@ from sam2.sam2_image_predictor import SAM2ImagePredictor
 from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
 
 
+def generate_patches(image, patch_size=1024, overlap=128):
+    """
+    Split image into overlapping patches.
+
+    Args:
+        image: Input image (H, W, C)
+        patch_size: Size of each patch
+        overlap: Overlap between adjacent patches
+
+    Returns:
+        List of (patch, x_offset, y_offset) tuples
+    """
+    h, w = image.shape[:2]
+    stride = patch_size - overlap
+    patches = []
+
+    for y in range(0, h, stride):
+        for x in range(0, w, stride):
+            y_end = min(y + patch_size, h)
+            x_end = min(x + patch_size, w)
+
+            # Extract patch
+            patch = image[y:y_end, x:x_end]
+
+            # Pad if needed
+            if patch.shape[0] < patch_size or patch.shape[1] < patch_size:
+                padded = np.zeros((patch_size, patch_size, image.shape[2]), dtype=image.dtype)
+                padded[:patch.shape[0], :patch.shape[1]] = patch
+                patch = padded
+
+            patches.append((patch, x, y))
+
+    print(f"[INFO] Generated {len(patches)} patches of size {patch_size}x{patch_size} with {overlap}px overlap")
+    return patches
+
+
+def merge_masks(all_masks, image_shape, overlap=128):
+    """
+    Merge masks from overlapping patches with NMS in overlap regions.
+
+    Args:
+        all_masks: List of mask dicts with 'segmentation', 'bbox', 'offset_x', 'offset_y'
+        image_shape: (H, W) of original image
+        overlap: Overlap size
+
+    Returns:
+        Merged list of masks
+    """
+    print(f"[INFO] Merging {len(all_masks)} masks from patches")
+
+    # Translate mask coordinates to global image space
+    global_masks = []
+    for mask_dict in all_masks:
+        mask = mask_dict.copy()
+        offset_x = mask.pop('offset_x', 0)
+        offset_y = mask.pop('offset_y', 0)
+
+        # Adjust bbox
+        x, y, w, h = mask['bbox']
+        mask['bbox'] = [x + offset_x, y + offset_y, w, h]
+
+        # Create full-size segmentation mask
+        full_seg = np.zeros(image_shape, dtype=bool)
+        seg = mask['segmentation']
+        y_end = min(offset_y + seg.shape[0], image_shape[0])
+        x_end = min(offset_x + seg.shape[1], image_shape[1])
+        full_seg[offset_y:y_end, offset_x:x_end] = seg[:y_end - offset_y, :x_end - offset_x]
+        mask['segmentation'] = full_seg
+
+        global_masks.append(mask)
+
+    # Simple deduplication: remove masks with high IoU in overlap regions
+    from scipy.spatial.distance import cdist
+
+    if len(global_masks) > 1:
+        keep = []
+        for i, mask in enumerate(global_masks):
+            should_keep = True
+            for kept_mask in keep:
+                intersection = np.logical_and(mask['segmentation'], kept_mask['segmentation']).sum()
+                union = np.logical_or(mask['segmentation'], kept_mask['segmentation']).sum()
+                iou = intersection / union if union > 0 else 0
+
+                if iou > 0.5:  # Duplicate threshold
+                    should_keep = False
+                    break
+
+            if should_keep:
+                keep.append(mask)
+
+        print(f"[INFO] Kept {len(keep)}/{len(global_masks)} masks after deduplication")
+        return keep
+
+    return global_masks
+
 
 def print_vram_usage(device=0):
     torch.cuda.synchronize(device)
@@ -52,8 +147,6 @@ def plot_images_and_save(images, grid_size, titles, save_path):
     print(f"[DEBUG] Saved grid image to {save_path} in {dt:.3f}s")
 
 
-
-
 if __name__ == '__main__':
     print("[INFO] Starting script")
     t_start = time.time()
@@ -76,17 +169,6 @@ if __name__ == '__main__':
     sam2_model = build_sam2(CONFIG, CHECKPOINT, device=DEVICE, apply_postprocessing=False)
 
     print("[INFO] Instantiating mask generator")
-    mask_generator = SAM2AutomaticMaskGenerator(sam2_model)
-
-    IMAGE_PATH = "/user/davide.mattioli/u20330/SegEdge/sam2_experiments/Images/S2L2Ax10_T32UNC-6bd2a7faa-20250813_TCI.jpg"
-    print("[INFO] Reading image from", IMAGE_PATH)
-    image_bgr = cv2.imread(IMAGE_PATH)
-    if image_bgr is None:
-        raise RuntimeError(f"Failed to load image at {IMAGE_PATH}")
-    print("[DEBUG] image_bgr shape:", image_bgr.shape)
-    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-
-    print("[INFO] Generating masks")
     mask_generator_2 = SAM2AutomaticMaskGenerator(
         model=sam2_model,
         points_per_side=256,
@@ -99,15 +181,46 @@ if __name__ == '__main__':
         min_mask_region_area=1000
     )
 
-    t_mask = time.time()
-    sam2_result_2 = mask_generator_2.generate(image_rgb)
-    print("[DEBUG] Mask generation took", time.time() - t_mask, "s")
+    IMAGE_PATH = "/user/davide.mattioli/u20330/SegEdge/sam2_experiments/Images/S2L2Ax10_T32UNC-6bd2a7faa-20250813_TCI.jpg"
+    print("[INFO] Reading image from", IMAGE_PATH)
+    image_bgr = cv2.imread(IMAGE_PATH)
+    if image_bgr is None:
+        raise RuntimeError(f"Failed to load image at {IMAGE_PATH}")
+    print("[DEBUG] image_bgr shape:", image_bgr.shape)
+    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
 
-    print("[INFO] Annotating image")
+    # Generate patches
+    PATCH_SIZE = 1024
+    OVERLAP = 128
+    patches = generate_patches(image_rgb, patch_size=PATCH_SIZE, overlap=OVERLAP)
+
+    # Process each patch
+    all_masks = []
+    for idx, (patch_rgb, offset_x, offset_y) in enumerate(patches):
+        print(f"[INFO] Processing patch {idx + 1}/{len(patches)} at offset ({offset_x}, {offset_y})")
+        t_patch = time.time()
+
+        patch_masks = mask_generator_2.generate(patch_rgb)
+
+        # Add offset information to each mask
+        for mask in patch_masks:
+            mask['offset_x'] = offset_x
+            mask['offset_y'] = offset_y
+
+        all_masks.extend(patch_masks)
+        print(f"[DEBUG] Patch {idx + 1} generated {len(patch_masks)} masks in {time.time() - t_patch:.2f}s")
+
+        # Clear cache periodically
+        if (idx + 1) % 5 == 0:
+            torch.cuda.empty_cache()
+
+    # Merge masks
+    merged_masks = merge_masks(all_masks, image_shape=image_rgb.shape[:2], overlap=OVERLAP)
+
+    print("[INFO] Annotating image with merged masks")
     mask_annotator = sv.MaskAnnotator(color_lookup=sv.ColorLookup.INDEX)
-    detections = sv.Detections.from_sam(sam_result=sam2_result_2)
+    detections = sv.Detections.from_sam(sam_result=merged_masks)
     annotated_image = mask_annotator.annotate(scene=image_bgr.copy(), detections=detections)
-    print("[DEBUG] annotated_image shape:", annotated_image.shape if hasattr(annotated_image, "shape") else type(annotated_image))
     print_vram_usage()
 
     print("[INFO] Calling plot_images_and_save ...")
