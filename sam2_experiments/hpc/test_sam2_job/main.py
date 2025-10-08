@@ -168,7 +168,17 @@ def print_vram_usage(device=0):
     print(f"[VRAM] allocated: {alloc/1024**2:.2f} MiB, reserved: {reserved/1024**2:.2f} MiB, free: {free/1024**2:.2f} MiB, total: {total/1024**2:.2f} MiB, peak: {peak/1024**2:.2f} MiB")
 
 
-def plot_images_and_save(images, grid_size, titles, save_path):
+def plot_images_and_save(images, grid_size, titles, save_path, dpi=300):
+    """
+    Save images in a grid with high quality.
+
+    Args:
+        images: List of images to display
+        grid_size: (nrows, ncols) tuple
+        titles: List of titles for each image
+        save_path: Path to save the output
+        dpi: DPI for output image (default 300 for high quality)
+    """
     print("[DEBUG] plot_images_and_save called")
     print("  grid_size:", grid_size)
     print("  #images:", len(images))
@@ -176,8 +186,21 @@ def plot_images_and_save(images, grid_size, titles, save_path):
         print(f"    image {i} shape:", img.shape if hasattr(img, "shape") else type(img))
     t0 = time.time()
     nrows, ncols = grid_size
-    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(5 * ncols, 5 * nrows))
+
+    # Calculate figure size based on actual image dimensions for better quality
+    if len(images) > 0 and hasattr(images[0], 'shape'):
+        img_h, img_w = images[0].shape[:2]
+        # Calculate figure size to maintain aspect ratio
+        # Use inches: divide by dpi to get proper size
+        fig_w = (img_w * ncols) / dpi
+        fig_h = (img_h * nrows) / dpi
+        figsize = (fig_w, fig_h)
+    else:
+        figsize = (8 * ncols, 8 * nrows)
+
+    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=figsize, dpi=dpi)
     axes = axes.flatten() if nrows * ncols > 1 else [axes]
+
     for idx, ax in enumerate(axes):
         if idx < len(images):
             img = images[idx]
@@ -187,15 +210,46 @@ def plot_images_and_save(images, grid_size, titles, save_path):
             except Exception as e:
                 print(f"[WARN] cvtColor failed for image {idx}: {e}")
                 rgb = img
-            ax.imshow(rgb)
+            ax.imshow(rgb, interpolation='bilinear')
             if titles and idx < len(titles):
-                ax.set_title(titles[idx])
+                ax.set_title(titles[idx], fontsize=10)
         ax.axis("off")
-    plt.tight_layout()
-    fig.savefig(save_path, bbox_inches='tight')
+
+    plt.subplots_adjust(wspace=0.05, hspace=0.05)
+    fig.savefig(save_path, dpi=dpi, bbox_inches='tight', pad_inches=0.1)
     plt.close(fig)
     dt = time.time() - t0
-    print(f"[DEBUG] Saved grid image to {save_path} in {dt:.3f}s")
+    print(f"[DEBUG] Saved grid image to {save_path} in {dt:.3f}s at {dpi} DPI")
+
+
+def save_individual_images(image_bgr, annotated_image, labels, output_dir="outputs"):
+    """
+    Save individual high-quality images without matplotlib compression.
+
+    Args:
+        image_bgr: Original BGR image
+        annotated_image: Annotated BGR image with masks
+        labels: Label map array
+        output_dir: Directory to save outputs
+    """
+    import os
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"[INFO] Saving individual high-quality images to {output_dir}/")
+
+    # Save original image
+    cv2.imwrite(f"{output_dir}/original.png", image_bgr, [cv2.IMWRITE_PNG_COMPRESSION, 0])
+
+    # Save annotated image
+    cv2.imwrite(f"{output_dir}/annotated.png", annotated_image, [cv2.IMWRITE_PNG_COMPRESSION, 0])
+
+    # Save label map as 16-bit TIFF
+    cv2.imwrite(f"{output_dir}/labels.tif", labels.astype(np.uint16))
+
+    print(f"[INFO] Saved:")
+    print(f"  - {output_dir}/original.png")
+    print(f"  - {output_dir}/annotated.png")
+    print(f"  - {output_dir}/labels.tif")
 
 
 if __name__ == '__main__':
@@ -268,6 +322,9 @@ if __name__ == '__main__':
 
     # Optionally save the label map as a GeoTIFF if needed
     # cv2.imwrite("labels.tif", labels.astype(np.uint16))
+
+    # Save individual high-quality images
+    save_individual_images(image_bgr, annotated_image, labels, output_dir="outputs")
 
     print("[INFO] Total script time:", time.time() - t_start, "s")
     print_vram_usage()
