@@ -90,7 +90,7 @@ if __name__ == '__main__':
     mask_generator_2 = SAM2AutomaticMaskGenerator(
         model=sam2_model,
         points_per_side=256,
-        points_per_batch=128,
+        points_per_batch=64,
         pred_iou_thresh=0.3,
         stability_score_thresh=0.92,
         stability_score_offset=0.7,
