@@ -174,8 +174,8 @@ if __name__ == '__main__':
     print("[INFO] Instantiating mask generator")
     mask_generator_2 = SAM2AutomaticMaskGenerator(
         model=sam2_model,
-        points_per_side=128,
-        points_per_batch=128,
+        points_per_side=64,
+        points_per_batch=64,
         pred_iou_thresh=0.5,
         stability_score_thresh=0.92,
         stability_score_offset=0.7,
