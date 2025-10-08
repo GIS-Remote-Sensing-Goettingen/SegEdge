@@ -448,6 +448,7 @@ if __name__ == '__main__':
 
     # Get next available output folder
     output_dir = get_next_output_folder()
+    os.makedirs(output_dir, exist_ok=True)
     logger.info(f"[SAVE] Using output folder: {output_dir}")
 
     logger.info("[SAVE] Calling plot_images_and_save ...")
