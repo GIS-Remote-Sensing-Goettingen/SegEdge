@@ -174,9 +174,9 @@ if __name__ == '__main__':
     print("[INFO] Instantiating mask generator")
     mask_generator_2 = SAM2AutomaticMaskGenerator(
         model=sam2_model,
-        points_per_side=256,
+        points_per_side=128,
         points_per_batch=64,
-        pred_iou_thresh=0.3,
+        pred_iou_thresh=0.5,
         stability_score_thresh=0.92,
         stability_score_offset=0.7,
         crop_n_layers=1,
@@ -193,7 +193,7 @@ if __name__ == '__main__':
     image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
 
     # Generate patches
-    PATCH_SIZE = 1024
+    PATCH_SIZE = 2048
     OVERLAP = 128
     patches = generate_patches(image_rgb, patch_size=PATCH_SIZE, overlap=OVERLAP)
 
