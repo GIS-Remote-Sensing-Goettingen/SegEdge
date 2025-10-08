@@ -2,12 +2,12 @@ import time
 from matplotlib import pyplot as plt
 import cv2
 import torch
-import base64
 import numpy as np
 import supervision as sv
+import copy
+import gc
 
 from sam2.build_sam import build_sam2
-from sam2.sam2_image_predictor import SAM2ImagePredictor
 from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
 
 
@@ -24,6 +24,11 @@ def generate_patches(image, patch_size=1024, overlap=128):
         List of (patch, x_offset, y_offset) tuples
     """
     h, w = image.shape[:2]
+
+    # Validate minimum size
+    if h < overlap or w < overlap:
+        raise ValueError(f"Image too small ({h}x{w}) for overlap {overlap}")
+
     stride = patch_size - overlap
     patches = []
 
@@ -38,7 +43,7 @@ def generate_patches(image, patch_size=1024, overlap=128):
             # Pad if needed
             if patch.shape[0] < patch_size or patch.shape[1] < patch_size:
                 padded = np.zeros((patch_size, patch_size, image.shape[2]), dtype=image.dtype)
-                padded[:patch.shape[0], :patch.shape[1]] = patch
+                padded[:patch.shape[0], :patch.shape[1]] = patch.copy()
                 patch = padded
 
             patches.append((patch, x, y))
@@ -64,7 +69,7 @@ def merge_masks(all_masks, image_shape, overlap=128):
     # Translate mask coordinates to global image space
     global_masks = []
     for mask_dict in all_masks:
-        mask = mask_dict.copy()
+        mask = copy.deepcopy(mask_dict)
         offset_x = mask.pop('offset_x', 0)
         offset_y = mask.pop('offset_y', 0)
 
@@ -83,8 +88,6 @@ def merge_masks(all_masks, image_shape, overlap=128):
         global_masks.append(mask)
 
     # Simple deduplication: remove masks with high IoU in overlap regions
-    from scipy.spatial.distance import cdist
-
     if len(global_masks) > 1:
         keep = []
         for i, mask in enumerate(global_masks):
@@ -213,6 +216,7 @@ if __name__ == '__main__':
         # Clear cache periodically
         if (idx + 1) % 5 == 0:
             torch.cuda.empty_cache()
+            gc.collect()
 
     # Merge masks
     merged_masks = merge_masks(all_masks, image_shape=image_rgb.shape[:2], overlap=OVERLAP)
