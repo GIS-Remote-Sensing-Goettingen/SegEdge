@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "segedge"
+version = "0.1.0"
+description = "Remote-sensing segmentation pipelines for tree crowns and farmland delineation."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+  {name = "SegEdge Contributors"}
+]
+dependencies = [
+  "numpy>=1.24",
+  "tqdm>=4.66",
+  "PyYAML>=6.0"
+]
+
+[project.optional-dependencies]
+dinov3 = [
+  "torch>=2.1",
+  "torchvision>=0.16",
+  "timm>=0.9",
+  "transformers>=4.37",
+  "rasterio>=1.3",
+  "scikit-image>=0.22",
+  "scikit-learn>=1.4",
+  "scipy>=1.11",
+  "opencv-python>=4.8",
+  "geopandas>=0.14",
+  "shapely>=2.0"
+]
+sam2 = [
+  "torch>=2.1",
+  "transformers>=4.37",
+  "tifffile>=2023.7.10",
+  "Pillow>=10.0",
+  "scipy>=1.11",
+  "opencv-python>=4.8",
+  "matplotlib>=3.8"
+]
+
+[project.urls]
+Homepage = "https://github.com/example/segedge"
+Documentation = "docs/architecture.md"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+sege = ["py.typed"]
