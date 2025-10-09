@@ -1,16 +1,24 @@
 
-# IntelliJ project files
-.idea
+# IDE / tooling
+.idea/
 *.iml
-*.pt
-out
-gen
-*.tif
-*.png
-*.gpkg
-*.log
-/chekpoints
-/{HOME}
-/sam2
-/Models
-/Dinov3_exmperiments/outputs
+.vscode/
+
+# Python artifacts
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# Generated files
+artifacts/logs/
+artifacts/outputs/
+artifacts/checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# Large data (provide via instructions instead)
+data/samples/imagery/*.tif
+artifacts/**/*.tif
+artifacts/**/*.png
+artifacts/**/*.gpkg
+artifacts/**/*.log

@@ -1,16 +1,70 @@
-import time
-from matplotlib import pyplot as plt
-import cv2
-import torch
-import numpy as np
-import supervision as sv
+import argparse
 import gc
+import glob
 import logging
 import os
-import glob
+import sys
+import time
+from pathlib import Path
+
+import cv2
+import numpy as np
+import torch
+from matplotlib import pyplot as plt
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+SAM2_REPO = PROJECT_ROOT / "third_party" / "sam2"
+if SAM2_REPO.exists():
+    sys.path.insert(0, str(SAM2_REPO))
 
 from sam2.build_sam import build_sam2
 from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+
+DEFAULT_CHECKPOINT = PROJECT_ROOT / "artifacts" / "checkpoints" / "sam2" / "models" / "sam2_hiera_large.pt"
+DEFAULT_MODEL_CONFIG = SAM2_REPO / "sam2" / "configs" / "sam2" / "sam2_hiera_l.yaml"
+DEFAULT_IMAGE = PROJECT_ROOT / "data" / "samples" / "imagery" / "1084-1393.tif"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "artifacts" / "outputs" / "sam2" / "hpc"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Tile-based SAM2 automatic mask generator for ultra-large scenes."
+    )
+    parser.add_argument("--image", type=Path, default=DEFAULT_IMAGE, help="Input image to segment.")
+    parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT, help="SAM2 checkpoint path.")
+    parser.add_argument(
+        "--model-config",
+        type=Path,
+        default=DEFAULT_MODEL_CONFIG,
+        help="SAM2 model configuration YAML.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR,
+        help="Base directory where outputs will be stored.",
+    )
+    parser.add_argument("--patch-size", type=int, default=2048, help="Patch size for tiling.")
+    parser.add_argument("--overlap", type=int, default=128, help="Overlap between patches.")
+    parser.add_argument("--points-per-side", type=int, default=64, help="SAM2 mask generator parameter.")
+    parser.add_argument("--points-per-batch", type=int, default=32, help="SAM2 mask generator parameter.")
+    parser.add_argument("--pred-iou-thresh", type=float, default=0.5, help="Minimum predicted IoU to keep a mask.")
+    parser.add_argument(
+        "--stability-score-thresh",
+        type=float,
+        default=0.92,
+        help="Minimum stability score when accepting masks.",
+    )
+    parser.add_argument("--stability-offset", type=float, default=0.7, help="Stability offset hyperparameter.")
+    parser.add_argument("--box-nms-thresh", type=float, default=0.7, help="Box NMS threshold.")
+    parser.add_argument("--min-mask-area", type=int, default=1000, help="Minimum mask region area (pixels).")
+    parser.add_argument(
+        "--output-prefix",
+        type=str,
+        default="run",
+        help="Prefix used when auto-incrementing output folders.",
+    )
+    return parser.parse_args()
 
 # Color codes for terminal output
 class Colors:
@@ -109,36 +163,33 @@ logger.addHandler(console_handler)
 logger.addHandler(file_handler)
 
 
-def get_next_output_folder(base_name="output_job"):
+def get_next_output_folder(base_dir: Path, prefix: str = "output_job") -> Path:
     """
-    Find the next available output folder name in the current directory.
-    Starts from output_job_0, output_job_1, etc.
+    Find the next available output folder name in ``base_dir``.
 
     Args:
-        base_name: Base name for output folders
+        base_dir: Directory where run folders are created.
+        prefix: Folder prefix (defaults to ``output_job``).
 
     Returns:
-        str: Next available folder name (e.g., 'output_job_3')
+        Path: Next available folder path (e.g. ``.../output_job_3``).
     """
-    existing_folders = glob.glob(f"{base_name}_*")
+    base_dir = Path(base_dir)
+    base_dir.mkdir(parents=True, exist_ok=True)
+    existing_folders = sorted(base_dir.glob(f"{prefix}_*"))
     if not existing_folders:
-        return f"{base_name}_0"
+        return base_dir / f"{prefix}_0"
 
-    # Extract numbers from folder names
     indices = []
     for folder in existing_folders:
         try:
-            # Extract number after last underscore
-            num = int(folder.split('_')[-1])
+            num = int(folder.name.split("_")[-1])
             indices.append(num)
         except ValueError:
             continue
 
-    if not indices:
-        return f"{base_name}_0"
-
-    next_index = max(indices) + 1
-    return f"{base_name}_{next_index}"
+    next_index = (max(indices) + 1) if indices else 0
+    return base_dir / f"{prefix}_{next_index}"
 
 
 def generate_patches(image, patch_size=1024, overlap=128):
@@ -384,6 +435,7 @@ def save_individual_images(image_bgr, annotated_image, labels, output_dir):
 
 
 if __name__ == '__main__':
+    cli_args = parse_args()
     logger.info("=" * 80)
     logger.info(f"{Colors.BRIGHT_GREEN}{Colors.BOLD}SAM2 Segmentation Pipeline Started{Colors.RESET}")
     logger.info("=" * 80)
@@ -402,43 +454,55 @@ if __name__ == '__main__':
     logger.info(f"[MODEL] Device: {DEVICE}")
     print_vram_usage()
 
-    CHECKPOINT = "/user/davide.mattioli/u20330/SegEdge/sam2_experiments/Models/sam2_hiera_large.pt"
-    CONFIG = "sam2_hiera_l.yaml"
+    checkpoint_path = Path(cli_args.checkpoint).expanduser().resolve()
+    config_path = Path(cli_args.model_config).expanduser().resolve()
+    image_path = Path(cli_args.image).expanduser().resolve()
+    output_root = Path(cli_args.output_dir).expanduser().resolve()
+
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    if not config_path.exists():
+        raise FileNotFoundError(f"SAM2 config not found: {config_path}")
+    if not image_path.exists():
+        raise FileNotFoundError(f"Image not found: {image_path}")
+
     logger.info("[MODEL] Building SAM2 model")
-    sam2_model = build_sam2(CONFIG, CHECKPOINT, device=DEVICE, apply_postprocessing=False)
+    sam2_model = build_sam2(
+        str(config_path),
+        str(checkpoint_path),
+        device=DEVICE,
+        apply_postprocessing=False,
+    )
 
     logger.info("[MODEL] Instantiating mask generator")
     mask_generator_2 = SAM2AutomaticMaskGenerator(
         model=sam2_model,
-        points_per_side=64,
-        points_per_batch=32,  # Reduced from 64 to lower peak VRAM
-        pred_iou_thresh=0.5,
-        stability_score_thresh=0.92,
-        stability_score_offset=0.7,
+        points_per_side=cli_args.points_per_side,
+        points_per_batch=cli_args.points_per_batch,
+        pred_iou_thresh=cli_args.pred_iou_thresh,
+        stability_score_thresh=cli_args.stability_score_thresh,
+        stability_score_offset=cli_args.stability_offset,
         crop_n_layers=0,  # Set to 0 since we're already tiling
-        box_nms_thresh=0.7,
-        min_mask_region_area=1000
+        box_nms_thresh=cli_args.box_nms_thresh,
+        min_mask_region_area=cli_args.min_mask_area,
     )
 
-    IMAGE_PATH = "/user/davide.mattioli/u20330/SegEdge/sam2_experiments/Images/S2L2Ax10_T32UNC-6bd2a7faa-20250813_TCI.jpg"
-    logger.info(f"[IMAGE] Reading image from {IMAGE_PATH}")
-    image_bgr = cv2.imread(IMAGE_PATH)
+    logger.info(f"[IMAGE] Reading image from {image_path}")
+    image_bgr = cv2.imread(str(image_path))
     if image_bgr is None:
-        raise RuntimeError(f"Failed to load image at {IMAGE_PATH}")
+        raise RuntimeError(f"Failed to load image at {image_path}")
     logger.debug(f"[IMAGE] image_bgr shape: {image_bgr.shape}")
     image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
 
     # Generate patches
-    PATCH_SIZE = 2048
-    OVERLAP = 128
-    patches = generate_patches(image_rgb, patch_size=PATCH_SIZE, overlap=OVERLAP)
+    patches = generate_patches(image_rgb, patch_size=cli_args.patch_size, overlap=cli_args.overlap)
 
     # Process patches into a single label map (avoids RAM blow-up)
     labels = process_patches_to_labelmap(
         patches,
         mask_generator_2,
         image_shape=image_rgb.shape[:2],
-        overlap=OVERLAP
+        overlap=cli_args.overlap
     )
 
     print_vram_usage()
@@ -447,8 +511,8 @@ if __name__ == '__main__':
     annotated_image = labelmap_to_colored_mask(labels, image_bgr)
 
     # Get next available output folder
-    output_dir = get_next_output_folder()
-    os.makedirs(output_dir, exist_ok=True)
+    output_dir = get_next_output_folder(output_root, prefix=cli_args.output_prefix)
+    output_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"[SAVE] Using output folder: {output_dir}")
 
     logger.info("[SAVE] Calling plot_images_and_save ...")
@@ -456,7 +520,7 @@ if __name__ == '__main__':
         images=[image_bgr, annotated_image],
         grid_size=(1, 2),
         titles=['source image', 'segmented image'],
-        save_path=f"{output_dir}/comparison_grid.png"
+        save_path=output_dir / "comparison_grid.png"
     )
 
     # Save individual high-quality images

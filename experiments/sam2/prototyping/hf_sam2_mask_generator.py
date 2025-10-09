@@ -1,8 +1,14 @@
+from pathlib import Path
+
 import rasterio, numpy as np, torch
 from PIL import Image
 from transformers import pipeline
 
-src = "../images/1084-1393.tif"; out = "fields_mask.tif"
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+src = PROJECT_ROOT / "data" / "samples" / "imagery" / "1084-1393.tif"
+out_dir = PROJECT_ROOT / "artifacts" / "outputs" / "sam2" / "prototyping"
+out_dir.mkdir(parents=True, exist_ok=True)
+out = out_dir / "fields_mask.tif"
 
 with rasterio.open(src) as ds:
     rgb = ds.read([1,2,3]).astype("uint8"); H, W = ds.height, ds.width

@@ -1,28 +1,27 @@
 #!/usr/bin/env python3
 """
-Minimal MVP: DINOv3-based (SAT-493M) segmentation and detection of individual trees
-from satellite GeoTIFFs. Saves:
-  1) binary mask (uint8, 0/1) for tree vs. non-tree
-  2) tree crown polygons (GeoPackage)
-  3) tree centroids as points (GeoPackage)
-Supports two modes:
-  - unsup: k-means on DINO dense features + morphology tuned for blob-like tree crowns
-  - linear: 1x1 conv "linear probe" if you provide a tiny labeled mask for a few tiles
+DINOv3-based tree crown delineation pipeline.
 
-Requirements (pip):
-  torch torchvision timm rasterio numpy scikit-image scikit-learn shapely geopandas tqdm
-  opencv-python (for contour extraction)
-Optional (for DINOv3): transformers
+This module implements an end-to-end workflow that extracts dense features from
+high-resolution satellite GeoTIFFs, segments tree canopies either via
+unsupervised clustering or a linear probe head, post-processes the mask, and
+vectorises crowns into GeoPackages. Run directly as a CLI with
+``python -m sege.pipelines.dinov3_tree_crowns`` or import the module and call
+``main`` programmatically.
 
-References:
-  - DINOv3 SAT-493M for satellite imagery
-  - Watershed segmentation for individual tree crown delineation
+Outputs:
+    1. Binary tree canopy mask (GeoTIFF)
+    2. Watershed instance labels (GeoTIFF)
+    3. Tree crown polygons and bounding boxes (GeoPackage)
+    4. Tree centroid points (GeoPackage)
+    5. QA overlay PNG
 """
 
 import argparse
 from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
+import logging
 import os
 import sys
 import time
@@ -42,7 +41,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
-import torch, math
+import math
 from transformers import AutoModel, AutoImageProcessor
 import cv2
 
@@ -51,12 +50,19 @@ import geopandas as gpd
 from shapely.geometry import Point, Polygon, MultiPolygon
 from shapely.ops import unary_union
 
+LOGGER = logging.getLogger("main_dino")
+LOGGER.addHandler(logging.NullHandler())
+
 CUDA_AVAILABLE = torch.cuda.is_available()
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_LOG_PATH = PROJECT_ROOT / "artifacts" / "logs" / "dinov3" / "main.log"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "artifacts" / "outputs" / "dinov3" / "inference"
 
 
 class StageProfiler:
-    def __init__(self):
+    def __init__(self, logger=None):
         self.records = OrderedDict()
+        self.logger = logger or LOGGER
 
     @contextmanager
     def track(self, name):
@@ -67,13 +73,14 @@ class StageProfiler:
             duration = time.perf_counter() - start
             total, count = self.records.get(name, (0.0, 0))
             self.records[name] = (total + duration, count + 1)
-            print(f"[TIMER] {name}: {duration:.3f}s (call {count + 1})")
+            self.logger.info("[TIMER] %s: %.3fs (call %d)", name, duration, count + 1)
 
     def summary(self):
-        print("\n[TIMER] Summary:")
+        self.logger.info("")
+        self.logger.info("[TIMER] Summary:")
         for name, (total, count) in self.records.items():
             avg = total / max(count, 1)
-            print(f"  - {name}: total={total:.3f}s, calls={count}, avg={avg:.3f}s")
+            self.logger.info("  - %s: total=%.3fs, calls=%d, avg=%.3fs", name, total, count, avg)
 
 
 PROFILER = StageProfiler()
@@ -84,7 +91,27 @@ def log_cuda(message):
         torch.cuda.synchronize()
         allocated = torch.cuda.memory_allocated() / (1024 ** 2)
         reserved = torch.cuda.memory_reserved() / (1024 ** 2)
-        print(f"[CUDA] {message} | allocated={allocated:.1f}MB reserved={reserved:.1f}MB")
+        LOGGER.info("[CUDA] %s | allocated=%.1fMB reserved=%.1fMB", message, allocated, reserved)
+
+
+def setup_logging(log_path):
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.handlers = []
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
+
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    LOGGER.addHandler(stream_handler)
+
+    if log_path:
+        log_path = Path(log_path)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_path)
+        file_handler.setFormatter(formatter)
+        LOGGER.addHandler(file_handler)
+
+    LOGGER.propagate = False
+    LOGGER.info("Logging initialized. Writing to %s", log_path if log_path else "stdout only")
 
 # -----------------------------
 # Utilities
@@ -515,7 +542,7 @@ def extract_dense_features(img_chw, extractor, device, size=896, stride=640, mea
             log_cuda("Post feature forward")
             out_chunks.append((f.detach().cpu().numpy(), yy, xx))
             patch_dur = time.perf_counter() - patch_start
-            print(f"[TIMER] patch ({yy},{xx}) -> {patch_dur:.3f}s")
+            LOGGER.info("[TIMER] patch (%d,%d) -> %.3fs", yy, xx, patch_dur)
         feat = stitch_map(out_chunks, (out_chunks[0][0].shape[0], H, W), size, stride)
         return feat  # C,H,W
 
@@ -524,6 +551,8 @@ def _run_kmeans_gpu(X, k=2, iters=20, tol=1e-4):
     N = X.shape[0]
     if N == 0:
         raise ValueError("Empty feature tensor passed to k-means.")
+    if X.dtype != torch.float32:
+        X = X.float()
     indices = torch.randperm(N, device=X.device)[:k]
     centers = X[indices].clone()
     for it in range(iters):
@@ -543,7 +572,7 @@ def _run_kmeans_gpu(X, k=2, iters=20, tol=1e-4):
         centers = new_centers
         log_cuda(f"KMeans iteration {it} centers updated (shift={shift.item():.6f})")
         if shift < tol:
-            print(f"[KMEANS] Converged in {it + 1} iterations (shift={shift.item():.6f}).")
+            LOGGER.info("[KMEANS] Converged in %d iterations (shift=%.6f).", it + 1, shift.item())
             break
     return labels, centers
 
@@ -564,10 +593,27 @@ def segment_unsupervised(feat_chw, image_chw=None, k=2,
     X = feat_chw.reshape(C, -1).T
     if device == "cuda" and CUDA_AVAILABLE:
         with PROFILER.track("kmeans_gpu"):
-            feat_tensor = torch.from_numpy(feat_chw).to(device=device, dtype=torch.float32)
-            flat_tensor = feat_tensor.reshape(C, -1).transpose(0, 1).contiguous()
-            labels_tensor, centers = _run_kmeans_gpu(flat_tensor, k=k)
-            y = labels_tensor.view(H, W).cpu().numpy()
+            total_pixels = X.shape[0]
+            rng = np.random.default_rng(0)
+            sample_size = min(200_000, total_pixels)
+            sample_idx = rng.choice(total_pixels, size=sample_size, replace=False)
+            sample_tensor = torch.from_numpy(X[sample_idx]).to(device=device, dtype=torch.float16)
+            sample_tensor = sample_tensor.float()
+            LOGGER.info("[KMEANS] GPU sample size: %d", sample_tensor.shape[0])
+            _, centers = _run_kmeans_gpu(sample_tensor, k=k)
+            del sample_tensor
+            torch.cuda.empty_cache()
+            labels_flat = np.empty(total_pixels, dtype=np.int32)
+            chunk_size = 100_000
+            for start in range(0, total_pixels, chunk_size):
+                end = min(start + chunk_size, total_pixels)
+                chunk_tensor = torch.from_numpy(X[start:end]).to(device=device, dtype=torch.float16).float()
+                dists = torch.cdist(chunk_tensor, centers, p=2)
+                labels_flat[start:end] = dists.argmin(dim=1).cpu().numpy()
+                LOGGER.info("[KMEANS] Assigned chunk %d-%d", start, end)
+                del chunk_tensor, dists
+                torch.cuda.empty_cache()
+            y = labels_flat.reshape(H, W)
             log_cuda("KMeans complete")
     else:
         with PROFILER.track("kmeans_cpu"):
@@ -635,7 +681,7 @@ def segment_unsupervised(feat_chw, image_chw=None, k=2,
                 except Exception:
                     pass
 
-            print(f"[SEG] Cluster {label_idx}: pix={pix_count}, coverage={coverage:.3f}, score={score:.3f}")
+            LOGGER.info("[SEG] Cluster %d: pix=%d, coverage=%.3f, score=%.3f", label_idx, pix_count, coverage, score)
             cluster_info.append({
                 "label": label_idx,
                 "score": score,
@@ -671,7 +717,7 @@ def segment_linear_probe(feat_chw, head_ckpt):
     return mask
 
 
-def main():
+def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--input", type=Path, required=True, help="GeoTIFF path")
     p.add_argument("--bands", type=str, default="",
@@ -685,9 +731,24 @@ def main():
     p.add_argument("--max-area", type=int, default=10000, help="Maximum tree crown area in pixels")
     p.add_argument("--min-distance", type=int, default=10, help="Minimum distance between tree centers for watershed")
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="Select compute device")
-    p.add_argument("--out_dir", type=Path, default=Path("outputs"))
-    args = p.parse_args()
+    p.add_argument(
+        "--log-file",
+        type=Path,
+        default=DEFAULT_LOG_PATH,
+        help="Path to write detailed logs",
+    )
+    p.add_argument(
+        "--out_dir",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR,
+        help="Destination directory for pipeline artifacts",
+    )
+    args = p.parse_args(argv)
 
+    setup_logging(args.log_file)
+    PROFILER.logger = LOGGER
+    PROFILER.records.clear()
+    LOGGER.info("Command args: %s", {k: str(v) for k, v in vars(args).items()})
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.device == "auto":
@@ -700,9 +761,9 @@ def main():
     if device == "cuda":
         cuda_index = torch.cuda.current_device()
         gpu_name = torch.cuda.get_device_name(cuda_index)
-        print(f"Using device: cuda ({gpu_name})")
+        LOGGER.info("Using device: cuda (%s)", gpu_name)
     else:
-        print("Using device: cpu")
+        LOGGER.info("Using device: cpu")
 
     # Read image
     bands = [int(b) for b in args.bands.split(",")] if args.bands else None
@@ -710,7 +771,7 @@ def main():
         arr, profile = load_geotiff(args.input, bands=bands, max_edge=args.max_edge)
 
     extractor = load_sat493m_extractor(device=device, large=True)
-    print(f"DINO extractor dtype: {extractor.dtype}, device: {extractor.device}")
+    LOGGER.info("DINO extractor dtype: %s, device: %s", extractor.dtype, extractor.device)
     log_cuda("Extractor loaded")
 
     # Dense features
@@ -722,7 +783,7 @@ def main():
         mask = segment_unsupervised(feat, image_chw=arr, k=2, device=device)
     else:
         if args.head is None or not args.head.exists():
-            print("ERROR: --head is required for mode=linear and must exist")
+            LOGGER.error("--head is required for mode=linear and must exist")
             sys.exit(1)
         mask = segment_linear_probe(feat, args.head)
 
@@ -758,8 +819,8 @@ def main():
             labels_relaxed = segment_individual_trees(mask_pp_relaxed, min_distance=relaxed_min_distance)
             gdf_relaxed, bbox_relaxed, bbox_pix_relaxed = extract_tree_polygons(labels_relaxed, profile, min_area=relaxed_min_area)
             if len(gdf_relaxed) > len(gdf_trees):
-                print(f"Relaxed thresholds to {len(gdf_relaxed)} trees "
-                      f"(min_area={relaxed_min_area}, min_distance={relaxed_min_distance}).")
+                LOGGER.info("Relaxed thresholds to %d trees (min_area=%d, min_distance=%d).",
+                            len(gdf_relaxed), relaxed_min_area, relaxed_min_distance)
                 mask_pp = mask_pp_relaxed
                 labels_ws = labels_relaxed
                 gdf_trees = gdf_relaxed
@@ -793,32 +854,31 @@ def main():
     gpkg_path = args.out_dir / (args.input.stem + "_tree_crowns.gpkg")
     if len(gdf_trees) > 0:
         gdf_trees.to_file(gpkg_path, driver="GPKG")
-        print(f"Detected {len(gdf_trees)} trees")
-        print(f"Saved tree crowns: {gpkg_path}")
+        LOGGER.info("Detected %d trees", len(gdf_trees))
+        LOGGER.info("Saved tree crowns: %s", gpkg_path)
 
         if len(gdf_bboxes) > 0:
             bbox_path = args.out_dir / (args.input.stem + "_tree_bboxes.gpkg")
             gdf_bboxes.to_file(bbox_path, driver="GPKG")
-            print(f"Saved tree bounding boxes: {bbox_path}")
+            LOGGER.info("Saved tree bounding boxes: %s", bbox_path)
 
         # Extract and save tree centroids
         gdf_points = extract_tree_points(gdf_trees)
         points_path = args.out_dir / (args.input.stem + "_tree_points.gpkg")
         gdf_points.to_file(points_path, driver="GPKG")
-        print(f"Saved tree centroids: {points_path}")
+        LOGGER.info("Saved tree centroids: %s", points_path)
         if len(gdf_trees) < 5:
-            print("Note: fewer than 5 trees met the filtering thresholds—"
-                  "consider tweaking --min-area/--min-distance for your imagery.")
+            LOGGER.info("Note: fewer than 5 trees met the filtering thresholds—consider tweaking --min-area/--min-distance.")
     else:
-        print("Warning: no trees detected—check thresholds or imagery resolution.")
+        LOGGER.warning("Warning: no trees detected—check thresholds or imagery resolution.")
 
     overlay_path = save_visualizations(arr, mask_pp, labels_ws, args.out_dir, args.input.stem, bbox_pix=bbox_pix)
     if overlay_path:
-        print(f"Saved overlay preview: {overlay_path}")
+        LOGGER.info("Saved overlay preview: %s", overlay_path)
 
-    print(f"Effective thresholds -> min_area: {effective_min_area}, min_distance: {effective_min_distance}")
-    print(f"Saved binary mask: {mask_path}")
-    print(f"Saved labeled image: {labels_path}")
+    LOGGER.info("Effective thresholds -> min_area: %d, min_distance: %d", effective_min_area, effective_min_distance)
+    LOGGER.info("Saved binary mask: %s", mask_path)
+    LOGGER.info("Saved labeled image: %s", labels_path)
 
     PROFILER.summary()
 

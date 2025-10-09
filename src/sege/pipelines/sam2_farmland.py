@@ -11,19 +11,22 @@ from PIL import Image
 from scipy import ndimage as ndi
 from transformers import Sam2Model, Sam2Processor
 
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_INPUT = PROJECT_ROOT / "data" / "samples" / "imagery" / "1084-1389.tif"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "artifacts" / "outputs" / "sam2" / "inference"
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--input",
         type=Path,
-        default=Path("../images/1084-1389.tif"),
+        default=DEFAULT_INPUT,
         help="Path to the multispectral GeoTIFF to segment.",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("../outputs"),
+        default=DEFAULT_OUTPUT_DIR,
         help="Directory where the mask and overlay will be written.",
     )
     parser.add_argument(
@@ -383,8 +386,8 @@ def save_outputs(rgb_uint8: np.ndarray, mask: np.ndarray, out_dir: Path, stem: s
     return mask_path, overlay_path
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
 
     multispectral = load_multispectral(args.input)
     band_indices = [int(idx.strip()) for idx in args.bands.split(",") if idx.strip()]
@@ -465,5 +468,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-

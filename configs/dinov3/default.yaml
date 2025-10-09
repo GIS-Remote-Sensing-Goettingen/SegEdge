@@ -1,0 +1,13 @@
+# Default configuration for the DINOv3 crown pipeline.
+input: data/samples/imagery/dinov3_smoll.tif
+bands: [1, 2, 3]
+mode: unsup
+device: auto
+max_edge: 4096
+patch: 896
+stride: 640
+min_area: 25
+max_area: 10000
+min_distance: 10
+log_file: artifacts/logs/dinov3/hpc.log
+out_dir: artifacts/outputs/dinov3/hpc

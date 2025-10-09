@@ -1,0 +1,9 @@
+-r ../base.txt
+
+torch>=2.1
+transformers>=4.37
+tifffile>=2023.7.10
+Pillow>=10.0
+scipy>=1.11
+opencv-python>=4.8
+matplotlib>=3.8
