@@ -25,6 +25,7 @@ Detailed deep-dives live under `docs/pipelines/`.
 ```bash
 python -m venv .venv
 source .venv/bin/activate
+pip install -e .
 pip install -r requirements/experiments/dinov3.txt
 
 # Tree crown segmentation (unsupervised)
@@ -41,6 +42,12 @@ python -m sege.pipelines.sam2_farmland \
 ```
 
 > **Note**: When running in offline environments, download the required SAM 2 and DINOv3 weights beforehand and set `TRANSFORMERS_OFFLINE=1`. Place checkpoints under `artifacts/checkpoints/`.
+
+For a single-step install with optional dependencies:
+
+```bash
+pip install -e .[dinov3,sam2]
+```
 
 ---
 

@@ -108,6 +108,7 @@ Configuration values can also be expressed in YAML (`configs/dinov3/*.yaml`) and
 
 ### Local CLI
 ```bash
+pip install -e .[dinov3]
 python -m sege.pipelines.dinov3_tree_crowns \
   --input data/samples/imagery/1084-1391.tif \
   --bands 4,3,2 \

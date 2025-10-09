@@ -89,6 +89,7 @@ The tiling driver additionally produces:
 
 ### Local CLI
 ```bash
+pip install -e .[sam2]
 python -m sege.pipelines.sam2_farmland \
   --input data/samples/imagery/1084-1393.tif \
   --bands 4,3,2 \
