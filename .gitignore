@@ -8,6 +8,7 @@ gen
 *.tif
 *.png
 *.gpkg
+*.log
 /chekpoints
 /{HOME}
 /sam2
