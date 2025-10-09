@@ -5,7 +5,6 @@
 #SBATCH --error=segmentation_job.err  # Error file
 
 #SBATCH -t 01:00:00                  # Estimated time, adapt to your needs
-#SBATCH --mail-type=all              # Send mail when job begins and ends
 
 #SBATCH --partition=scc-gpu        # Partition (queue) name
 #SBATCH --gres=gpu:1         # The partition
