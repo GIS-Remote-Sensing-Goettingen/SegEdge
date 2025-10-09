@@ -102,6 +102,7 @@ sbatch experiments/sam2/hpc/slurm_sam2.sh \
   --export=IMAGE_PATH=/scratch/farms/scene.tif,OUTPUT_DIR=/scratch/outputs/scene
 ```
 The SLURM script forwards parameters to `tiling_mask_generator.py`, which will automatically create unique run folders under `OUTPUT_DIR`.
+It also injects the repository `src/` directory into `PYTHONPATH` before launching Python. Do the same when invoking the driver directly outside SLURM: `PYTHONPATH=$PWD/src python experiments/sam2/hpc/tiling_mask_generator.py ...`.
 
 ---
 

@@ -34,6 +34,8 @@ nvcc -V
 
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
 
+export PYTHONPATH="${PWD}/src:${PYTHONPATH}"
+
 CHECKPOINT=${CHECKPOINT:-artifacts/checkpoints/sam2/models/sam2_hiera_large.pt}
 MODEL_CONFIG=${MODEL_CONFIG:-third_party/sam2/sam2/configs/sam2/sam2_hiera_l.yaml}
 IMAGE_PATH=${IMAGE_PATH:-data/samples/imagery/1084-1393.tif}

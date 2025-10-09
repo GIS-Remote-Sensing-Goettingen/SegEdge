@@ -121,6 +121,7 @@ sbatch experiments/dinov3/hpc/slurm_dinov3.sh \
   --export=INPUT_PATH=/scratch/tiles/site1.tif,OUTPUT_DIR=/scratch/runs/site1
 ```
 The SLURM wrapper loads `configs/dinov3/default.yaml` and pushes parameters through the shared pipeline via `experiments/dinov3/hpc/tiling_tree_crowns.py`.
+It also exports `PYTHONPATH=$PWD/src` so the `sege` package resolves without a full install. Recreate that step if you run the driver manually (`PYTHONPATH=$PWD/src python experiments/dinov3/hpc/tiling_tree_crowns.py ...`).
 
 ---
 
