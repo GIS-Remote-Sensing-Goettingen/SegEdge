@@ -37,7 +37,7 @@ cd "${SLURM_SUBMIT_DIR:-$PWD}"
 
 export PYTHONPATH="${PWD}/src:${PYTHONPATH}"
 
-INPUT_PATH=${INPUT_PATH:-data/samples/imagery/dinov3_smoll.tif}
+INPUT_PATH=${INPUT_PATH:-images/dinov3_smoll.tif}
 OUTPUT_DIR=${OUTPUT_DIR:-artifacts/outputs/dinov3/hpc}
 LOG_PATH=${LOG_PATH:-artifacts/logs/dinov3/hpc_run.log}
 BAND_INDICES=${BAND_INDICES:-1,2,3}
