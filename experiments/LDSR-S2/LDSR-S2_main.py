@@ -39,35 +39,13 @@ if __name__ == "__main__":
 
 
 
-    def save_sr_image(sr, out_file='sr image.png', mean=None, std=None, apply_gamma=True):
-        """
-        Save first SR RGB frame from tensor BxCxHxW with common fixes:
-        - optional inverse normalization (mean/std lists)
-        - clip to 0..1
-        - optional sRGB gamma correction (power 1/2.2)
-        """
-        import numpy as np
+    def save_sr_image(sr, out_file='sr image.png'):
         import matplotlib.pyplot as plt
-        # sr: torch tensor BxCxHxW
-        img = sr[0, :3].permute(1, 2, 0).cpu().numpy()  # HxWxC
-
-        # Inverse normalization if model used (mean/std as lists of 3 floats)
-        if mean is not None and std is not None:
-            mean = np.array(mean).reshape(1, 1, 3)
-            std = np.array(std).reshape(1, 1, 3)
-            img = img * std + mean
-
-        # Remove any arbitrary global multiplier before saving (don't multiply by 3.5)
-        # Clip to valid display range
-        img = np.clip(img, 0.0, 1.0)
-
-        # Apply sRGB gamma (linear->sRGB) to avoid washed appearance
-        if apply_gamma:
-            img = np.power(img, 1.0 / 2.2)
-
-        # Convert to uint8 and save
-        img_uint8 = (img * 255.0).round().astype(np.uint8)
-        plt.imsave(out_file, img_uint8)
+        # apply same ops as the original function
+        sr = sr.cpu() * 3.5
+        sr = sr.clamp(0.001, 0.9999)
+        img = sr[0, :3].permute(1, 2, 0).numpy()  # HxWxC
+        plt.imsave(out_file, img)
 
 
     # Set Device
