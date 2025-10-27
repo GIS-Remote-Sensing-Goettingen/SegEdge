@@ -35,16 +35,37 @@ def load_dinov3_model(device: str):
     Returns:
         Tuple of (processor, model)
     """
+    import subprocess
+
+    print("Checking Hugging Face authentication status...")
+    try:
+        result = subprocess.run(
+            ["huggingface-cli", "whoami"],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode == 0:
+            print(f"Authenticated as: {result.stdout.strip()}")
+        else:
+            print("Not authenticated or token not found")
+    except Exception as e:
+        print(f"Could not check auth status: {e}")
+
+    print("Loading DINOv3 processor...")
     processor = AutoImageProcessor.from_pretrained(
         "facebook/dinov3-vitl16-pretrain-sat493m"
     )
+    print("Processor loaded successfully!")
+
+    print("Loading DINOv3 model (this may take a while if downloading)...")
     model = AutoModel.from_pretrained(
         "facebook/dinov3-vitl16-pretrain-sat493m",
         token=True
     ).to(device).eval()
+    print(f"Model loaded successfully and moved to {device}!")
 
     return processor, model
-
 
 def pad_image_to_patch_size(img: Image.Image, patch_size: int, processor):
     """
