@@ -19,9 +19,12 @@ from sklearn.cluster import MiniBatchKMeans
 import os
 
 # Constants
-PATCH_SIZE = 16
-IMG_SIZE = 800
-N_CLUSTERS = 8
+CHUNK_SIZE = 1000000 # for feature conversion to numpy
+TILE_SIZE = 1024 # tile size for AnyUp upscaling
+MIN_TILE_SIZE = 128  # minimum tile size to avoid small edge tiles
+PATCH_SIZE = 16 # DINOv3 ViT patch size
+IMG_SIZE = 800 # target image size for testing
+N_CLUSTERS = 8 # number of clusters for k-means
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 IMG = "to_upscale.png"  # Path to input image
 
@@ -139,8 +142,6 @@ def upsample_features(hr_image: torch.Tensor, lr_features: torch.Tensor, device:
         Upsampled features (B, D, H, W)
     """
     _, _, H, W = hr_image.shape
-    tile_size = 512  # Process 512×512 tiles
-    min_tile_size = 64  # Minimum tile size to avoid padding errors
 
     print("Loading AnyUp model from cache...")
     upsampler = torch.hub.load("wimmerth/anyup", "anyup", force_reload=False).to(device).eval()
@@ -148,25 +149,25 @@ def upsample_features(hr_image: torch.Tensor, lr_features: torch.Tensor, device:
 
     hr_features_list = []
 
-    for i in range(0, H, tile_size):
+    for i in range(0, H, TILE_SIZE):
         row_features = []
-        for j in range(0, W, tile_size):
+        for j in range(0, W, TILE_SIZE):
             # Extract tile boundaries
-            h_end = min(i + tile_size, H)
-            w_end = min(j + tile_size, W)
+            h_end = min(i + TILE_SIZE, H)
+            w_end = min(j + TILE_SIZE, W)
 
             # Check if tile is too small
             tile_h = h_end - i
             tile_w = w_end - j
 
             # If edge tile is too small, extend backwards to get minimum size
-            if tile_h < min_tile_size:
-                i_start = max(0, h_end - min_tile_size)
+            if tile_h < MIN_TILE_SIZE:
+                i_start = max(0, h_end - MIN_TILE_SIZE)
             else:
                 i_start = i
 
-            if tile_w < min_tile_size:
-                j_start = max(0, w_end - min_tile_size)
+            if tile_w < MIN_TILE_SIZE:
+                j_start = max(0, w_end - MIN_TILE_SIZE)
             else:
                 j_start = j
 
@@ -226,19 +227,18 @@ def cluster_features(hr_features: torch.Tensor, n_clusters: int = 8):
 
     # Convert to numpy in smaller chunks to avoid OOM
     print("Converting to numpy and normalizing in batches...")
-    chunk_size = 100000  # Smaller chunks for safety
     num_vectors = X.shape[1]
 
     print("Total vectors to process:", num_vectors)
-    num_chunks = (num_vectors + chunk_size - 1) // chunk_size
-    print(f"Processing in {num_chunks} chunks of up to {chunk_size} vectors each.")
+    num_chunks = (num_vectors + CHUNK_SIZE - 1) // CHUNK_SIZE
+    print(f"Processing in {num_chunks} chunks of up to {CHUNK_SIZE} vectors each.")
 
     # Pre-allocate numpy array
     X_np = np.empty((num_vectors, C), dtype=np.float32)
     print("Allocated X_np with shape:", X_np.shape)
     for i in range(num_chunks):
-        start_idx = i * chunk_size
-        end_idx = min((i + 1) * chunk_size, num_vectors)
+        start_idx = i * CHUNK_SIZE
+        end_idx = min((i + 1) * CHUNK_SIZE, num_vectors)
 
         # Convert chunk to numpy
         print(f"  Converting chunk {i+1}/{num_chunks} (vectors {start_idx} to {end_idx}) to numpy...")
@@ -259,8 +259,8 @@ def cluster_features(hr_features: torch.Tensor, n_clusters: int = 8):
     kmeans = MiniBatchKMeans(
         n_clusters=n_clusters,
         random_state=8,
-        batch_size=2048,
-        max_iter=100,
+        batch_size=8016,
+        max_iter=1000,
         verbose=1
     )
 
