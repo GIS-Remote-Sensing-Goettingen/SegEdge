@@ -242,7 +242,7 @@ def cluster_features(hr_features: torch.Tensor, n_clusters: int = 8):
 
         # Convert chunk to numpy
         print(f"  Converting chunk {i+1}/{num_chunks} (vectors {start_idx} to {end_idx}) to numpy...")
-        chunk = X[0, start_idx:end_idx].numpy().astype(np.float32)
+        chunk = X[0, start_idx:end_idx].cpu().numpy().astype(np.float32)
 
         print("    Chunk shape before normalization:", chunk.shape)
         # L2 normalize
