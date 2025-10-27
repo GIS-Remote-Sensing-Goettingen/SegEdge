@@ -125,9 +125,10 @@ def extract_dinov3_features(hr_image: torch.Tensor, model, device: str):
 
     return lr_features
 
+
 def upsample_features(hr_image: torch.Tensor, lr_features: torch.Tensor, device: str):
     """
-    Upsample features using AnyUp model.
+    Upsample features using AnyUp model in tiles.
 
     Args:
         hr_image: High-resolution image tensor (B, C, H, W)
@@ -137,22 +138,39 @@ def upsample_features(hr_image: torch.Tensor, lr_features: torch.Tensor, device:
     Returns:
         Upsampled features (B, D, H, W)
     """
+    _, _, H, W = hr_image.shape
+    tile_size = 512  # Process 512×512 tiles
+
     print("Loading AnyUp model from cache...")
-    upsampler = torch.hub.load(
-        "wimmerth/anyup",
-        "anyup",
-        verbose=False,
-        force_reload=False  # Use cache
-    ).to(device).eval()  # Use GPU instead of CPU
+    upsampler = torch.hub.load("wimmerth/anyup", "anyup", force_reload=False).to(device).eval()
 
-    with torch.no_grad():
-        hr_features = upsampler(hr_image, lr_features, q_chunk_size=4)
+    hr_features_list = []
 
-    print("hr_features shape:", tuple(hr_features.shape))
+    for i in range(0, H, tile_size):
+        row_features = []
+        for j in range(0, W, tile_size):
+            # Extract tile boundaries
+            h_end = min(i + tile_size, H)
+            w_end = min(j + tile_size, W)
+
+            # Extract tiles and make them contiguous
+            hr_tile = hr_image[:, :, i:h_end, j:w_end].contiguous()
+            lr_tile = lr_features[:, :, i // 16:(h_end // 16), j // 16:(w_end // 16)].contiguous()
+
+            print(f"Processing tile [{i}:{h_end}, {j}:{w_end}] - HR: {hr_tile.shape}, LR: {lr_tile.shape}")
+
+            # Process tile
+            with torch.no_grad():
+                tile_features = upsampler(hr_tile, lr_tile, q_chunk_size=64)
+
+            row_features.append(tile_features)
+
+        hr_features_list.append(torch.cat(row_features, dim=3))
+
+    hr_features = torch.cat(hr_features_list, dim=2)
+    print("Final hr_features shape:", tuple(hr_features.shape))
 
     return hr_features
-
-
 
 
 def cluster_features(hr_features: torch.Tensor, n_clusters: int = 8):
