@@ -27,7 +27,7 @@ IMG = "to_upscale.png"  # Path to input image
 
 def load_dinov3_model(device: str):
     """
-    Load DINOv3 ViT-L/16 model and processor.
+    Load DINOv3 ViT-L/16 model and processor from local cache.
 
     Args:
         device: Device to load model on ('cuda' or 'cpu')
@@ -35,32 +35,17 @@ def load_dinov3_model(device: str):
     Returns:
         Tuple of (processor, model)
     """
-    import subprocess
-
-    print("Checking Hugging Face authentication status...")
-    try:
-        result = subprocess.run(
-            ["huggingface-cli", "whoami"],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        if result.returncode == 0:
-            print(f"Authenticated as: {result.stdout.strip()}")
-        else:
-            print("Not authenticated or token not found")
-    except Exception as e:
-        print(f"Could not check auth status: {e}")
-
-    print("Loading DINOv3 processor...")
+    print("Loading DINOv3 processor from cache...")
     processor = AutoImageProcessor.from_pretrained(
-        "facebook/dinov3-vitl16-pretrain-sat493m"
+        "facebook/dinov3-vitl16-pretrain-sat493m",
+        local_files_only=True  # Force using cached files
     )
     print("Processor loaded successfully!")
 
-    print("Loading DINOv3 model (this may take a while if downloading)...")
+    print("Loading DINOv3 model from cache...")
     model = AutoModel.from_pretrained(
         "facebook/dinov3-vitl16-pretrain-sat493m",
+        local_files_only=True,  # Force using cached files
         token=True
     ).to(device).eval()
     print(f"Model loaded successfully and moved to {device}!")
@@ -140,34 +125,34 @@ def extract_dinov3_features(hr_image: torch.Tensor, model, device: str):
 
     return lr_features
 
-
-def upsample_features(hr_image: torch.Tensor, lr_features: torch.Tensor):
+def upsample_features(hr_image: torch.Tensor, lr_features: torch.Tensor, device: str):
     """
     Upsample features using AnyUp model.
 
     Args:
         hr_image: High-resolution image tensor (B, C, H, W)
         lr_features: Low-resolution features (B, D, Hp, Wp)
+        device: Device for computation
 
     Returns:
         Upsampled features (B, D, H, W)
     """
-    # now feed hr_image and lr_features to the upsampler
+    print("Loading AnyUp model from cache...")
     upsampler = torch.hub.load(
         "wimmerth/anyup",
         "anyup",
-        verbose=False
-    ).cpu().eval()
-
-    hr_image_cpu = hr_image.cpu()
-    lr_features_cpu = lr_features.cpu()
+        verbose=False,
+        force_reload=False  # Use cache
+    ).to(device).eval()  # Use GPU instead of CPU
 
     with torch.no_grad():
-        hr_features = upsampler(hr_image_cpu, lr_features_cpu, q_chunk_size=64)
+        hr_features = upsampler(hr_image, lr_features, q_chunk_size=64)
 
     print("hr_features shape:", tuple(hr_features.shape))
 
     return hr_features
+
+
 
 
 def cluster_features(hr_features: torch.Tensor, n_clusters: int = 8):
@@ -266,7 +251,7 @@ def main():
     lr_features = extract_dinov3_features(hr_image, model, DEVICE)
 
     # Upsample features
-    hr_features = upsample_features(hr_image, lr_features)
+    hr_features = upsample_features(hr_image, lr_features, DEVICE)
 
     # Cluster features
     labels, H, W = cluster_features(hr_features, n_clusters=N_CLUSTERS)
