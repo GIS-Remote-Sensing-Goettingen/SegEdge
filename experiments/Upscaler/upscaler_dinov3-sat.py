@@ -210,22 +210,23 @@ def upsample_features(hr_image: torch.Tensor, lr_features: torch.Tensor, device:
     return hr_features
 
 
-def cluster_features(hr_features: torch.Tensor, n_clusters: int = 8):
+def cluster_features(features: torch.Tensor, n_clusters: int = 8, is_hr: bool = True):
     """
-    Cluster upsampled features using k-means.
+    Cluster features using k-means.
 
     Args:
-        hr_features: Upsampled feature tensor (B, C, H, W)
+        features: Feature tensor (B, C, H, W) for HR or (B, D, Hp, Wp) for LR
         n_clusters: Number of clusters for k-means
+        is_hr: True for HR features (pixel-level), False for LR features (patch-level)
 
     Returns:
         Tuple of (cluster labels, height, width)
     """
-    B, C, H, W = hr_features.shape
+    B, C, H, W = features.shape
 
-    # Reshape to (num_pixels, feature_dim) - still on CPU as tensor
-    X = hr_features.permute(0, 2, 3, 1).reshape(B, -1, C)
-    print("X shape:", X.shape)
+    # Reshape to (num_pixels, feature_dim)
+    X = features.permute(0, 2, 3, 1).reshape(B, -1, C)
+    print(f"X shape: {X.shape} ({'HR' if is_hr else 'LR'} features)")
 
     # Convert to numpy in smaller chunks to avoid OOM
     print("Converting to numpy and normalizing in batches...")
@@ -274,7 +275,7 @@ def cluster_features(hr_features: torch.Tensor, n_clusters: int = 8):
     return labels, H, W
 
 
-def visualize_clusters(labels: np.ndarray, height: int, width: int):
+def visualize_clusters(labels: np.ndarray, height: int, width: int, fig_name: str = "cluster_map.png"):
     """
     Visualize cluster assignments as a spatial map.
 
@@ -298,7 +299,7 @@ def visualize_clusters(labels: np.ndarray, height: int, width: int):
 
     # save the figure
     plt.axis("off")
-    plt.savefig("cluster_map.png", bbox_inches="tight", pad_inches=0, dpi=300)
+    plt.savefig(fig_name, bbox_inches="tight", pad_inches=0, dpi=300)
 
 
 def main():
@@ -321,6 +322,12 @@ def main():
 
     # Extract DINOv3 features
     lr_features = extract_dinov3_features(hr_image, model, DEVICE)
+
+    #Cluster LR features for comparison
+    lr_labels, LHp, LWp = cluster_features(lr_features, n_clusters=N_CLUSTERS, is_hr=False)
+
+    # Visualize LR clusters
+    visualize_clusters(lr_labels, LHp, LWp, fig_name="lr_cluster_map.png")
 
     # Upsample features
     hr_features = upsample_features(hr_image, lr_features, DEVICE)
