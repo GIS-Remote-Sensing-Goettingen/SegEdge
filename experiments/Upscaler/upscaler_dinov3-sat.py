@@ -228,18 +228,23 @@ def cluster_features(hr_features: torch.Tensor, n_clusters: int = 8):
     print("Converting to numpy and normalizing in batches...")
     chunk_size = 100000  # Smaller chunks for safety
     num_vectors = X.shape[1]
+
+    print("Total vectors to process:", num_vectors)
     num_chunks = (num_vectors + chunk_size - 1) // chunk_size
+    print(f"Processing in {num_chunks} chunks of up to {chunk_size} vectors each.")
 
     # Pre-allocate numpy array
     X_np = np.empty((num_vectors, C), dtype=np.float32)
-
+    print("Allocated X_np with shape:", X_np.shape)
     for i in range(num_chunks):
         start_idx = i * chunk_size
         end_idx = min((i + 1) * chunk_size, num_vectors)
 
         # Convert chunk to numpy
+        print(f"  Converting chunk {i+1}/{num_chunks} (vectors {start_idx} to {end_idx}) to numpy...")
         chunk = X[0, start_idx:end_idx].numpy().astype(np.float32)
 
+        print("    Chunk shape before normalization:", chunk.shape)
         # L2 normalize
         norms = np.linalg.norm(chunk, axis=1, keepdims=True) + 1e-8
         X_np[start_idx:end_idx] = chunk / norms
