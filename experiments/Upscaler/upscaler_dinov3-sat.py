@@ -18,13 +18,15 @@ from transformers import AutoImageProcessor, AutoModel
 from sklearn.cluster import MiniBatchKMeans
 import os
 
+
 # Constants
 CHUNK_SIZE = 1000000 # for feature conversion to numpy
-TILE_SIZE = 1024 # tile size for AnyUp upscaling
+TILE_SIZE = 2048 # tile size for AnyUp upscaling
 MIN_TILE_SIZE = 128  # minimum tile size to avoid small edge tiles
 PATCH_SIZE = 16 # DINOv3 ViT patch size
 IMG_SIZE = 800 # target image size for testing
 N_CLUSTERS = 8 # number of clusters for k-means
+Q_CHUNK_SIZE = 256  # chunk size for AnyUp attention
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 IMG = "to_upscale.png"  # Path to input image
 
@@ -179,7 +181,7 @@ def upsample_features(hr_image: torch.Tensor, lr_features: torch.Tensor, device:
 
             # Process tile
             with torch.no_grad():
-                tile_features = upsampler(hr_tile, lr_tile, q_chunk_size=64)
+                tile_features = upsampler(hr_tile, lr_tile, q_chunk_size=Q_CHUNK_SIZE)
 
             # If we extended the tile, crop back to original boundary
             if i_start < i or j_start < j:
