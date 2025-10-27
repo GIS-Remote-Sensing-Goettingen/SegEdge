@@ -139,7 +139,7 @@ def upsample_features(hr_image: torch.Tensor, lr_features: torch.Tensor, device:
         Upsampled features (B, D, H, W)
     """
     _, _, H, W = hr_image.shape
-    tile_size = 512  # Process 512×512 tiles
+    tile_size = 128  # Process 512×512 tiles
 
     print("Loading AnyUp model from cache...")
     upsampler = torch.hub.load("wimmerth/anyup", "anyup", force_reload=False).to(device).eval()
@@ -166,6 +166,26 @@ def upsample_features(hr_image: torch.Tensor, lr_features: torch.Tensor, device:
             row_features.append(tile_features)
 
         hr_features_list.append(torch.cat(row_features, dim=3))
+
+        if torch.cuda.is_available():
+            device = torch.cuda.current_device()
+
+            # Total memory
+            total = torch.cuda.get_device_properties(device).total_memory / 1024 ** 3
+
+            # Currently allocated
+            allocated = torch.cuda.memory_allocated(device) / 1024 ** 3
+
+            # Reserved by PyTorch
+            reserved = torch.cuda.memory_reserved(device) / 1024 ** 3
+
+            # Free memory (approximation)
+            free = total - allocated
+
+            print(f"Total: {total:.2f} GB")
+            print(f"Allocated: {allocated:.2f} GB")
+            print(f"Reserved: {reserved:.2f} GB")
+            print(f"Free: {free:.2f} GB")
 
     hr_features = torch.cat(hr_features_list, dim=2)
     print("Final hr_features shape:", tuple(hr_features.shape))
@@ -204,7 +224,7 @@ def cluster_features(hr_features: torch.Tensor, n_clusters: int = 8):
     # roads/roofs/veg/shadows etc.)
     kmeans = MiniBatchKMeans(
         n_clusters=n_clusters,
-        random_state=12,
+        random_state=8,
         batch_size=2048,
         max_iter=100
     )
