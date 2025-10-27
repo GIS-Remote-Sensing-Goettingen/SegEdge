@@ -220,30 +220,34 @@ def cluster_features(hr_features: torch.Tensor, n_clusters: int = 8):
     """
     B, C, H, W = hr_features.shape
 
-    # Reshape to (num_pixels, feature_dim)
+    # Reshape to (num_pixels, feature_dim) - still on CPU as tensor
     X = hr_features.permute(0, 2, 3, 1).reshape(B, -1, C)
     print("X shape:", X.shape)
 
-    # Move to CPU and convert to numpy
-    X = X[0].cpu().numpy().astype("float32")
+    # Convert to numpy in smaller chunks to avoid OOM
+    print("Converting to numpy and normalizing in batches...")
+    chunk_size = 100000  # Smaller chunks for safety
+    num_vectors = X.shape[1]
+    num_chunks = (num_vectors + chunk_size - 1) // chunk_size
 
-    # L2-normalize in chunks to avoid memory issues
-    print("Normalizing features in batches...")
-    chunk_size = 100000  # Process 100k vectors at a time
-    num_chunks = (X.shape[0] + chunk_size - 1) // chunk_size
+    # Pre-allocate numpy array
+    X_np = np.empty((num_vectors, C), dtype=np.float32)
 
     for i in range(num_chunks):
         start_idx = i * chunk_size
-        end_idx = min((i + 1) * chunk_size, X.shape[0])
+        end_idx = min((i + 1) * chunk_size, num_vectors)
 
-        chunk = X[start_idx:end_idx]
+        # Convert chunk to numpy
+        chunk = X[0, start_idx:end_idx].numpy().astype(np.float32)
+
+        # L2 normalize
         norms = np.linalg.norm(chunk, axis=1, keepdims=True) + 1e-8
-        X[start_idx:end_idx] = chunk / norms
+        X_np[start_idx:end_idx] = chunk / norms
 
-        if (i + 1) % 10 == 0:
-            print(f"  Normalized {end_idx}/{X.shape[0]} vectors")
+        if (i + 1) % 10 == 0 or (i + 1) == num_chunks:
+            print(f"  Processed {end_idx}/{num_vectors} vectors")
 
-    print("X shape:", X.shape, " mean L2 norm:", float(np.linalg.norm(X[:10000], axis=1).mean()))
+    print("X_np shape:", X_np.shape, " mean L2 norm:", float(np.linalg.norm(X_np[:10000], axis=1).mean()))
 
     # Use MiniBatchKMeans for memory efficiency
     print(f"Running MiniBatchKMeans with {n_clusters} clusters...")
@@ -252,10 +256,10 @@ def cluster_features(hr_features: torch.Tensor, n_clusters: int = 8):
         random_state=8,
         batch_size=2048,
         max_iter=100,
-        verbose=1  # Show progress
+        verbose=1
     )
 
-    labels = kmeans.fit_predict(X)
+    labels = kmeans.fit_predict(X_np)
 
     print("labels shape:", labels.shape, " | counts per cluster:",
           np.bincount(labels, minlength=n_clusters))
