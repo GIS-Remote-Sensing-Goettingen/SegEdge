@@ -3,7 +3,7 @@
 #SBATCH --job-name=upscaler_dinov3-sat
 #SBATCH --output=upscaler_dinov3-sat.out
 #SBATCH --error=upscaler_dinov3-sat.err
-
+#SBATCH --mem=128G
 #SBATCH -t 01:00:00                  # Estimated time, adapt to your needs
 
 #SBATCH --partition=scc-gpu        # Partition (queue) name
