@@ -16,7 +16,7 @@ from PIL import Image
 from torchvision import transforms
 from transformers import AutoImageProcessor, AutoModel
 from sklearn.cluster import MiniBatchKMeans
-
+import os
 
 # Constants
 PATCH_SIZE = 16
