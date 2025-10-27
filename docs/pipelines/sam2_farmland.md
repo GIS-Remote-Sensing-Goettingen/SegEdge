@@ -99,7 +99,7 @@ python -m sege.pipelines.sam2_farmland \
 
 ### HPC tiling workflow
 ```bash
-sbatch experiments/sam2/hpc/slurm_sam2.sh \
+sbatch experiments/sam2/hpc/slurm_upscaler.sh \
   --export=IMAGE_PATH=/scratch/farms/scene.tif,OUTPUT_DIR=/scratch/outputs/scene
 ```
 The SLURM script forwards parameters to `tiling_mask_generator.py`, which will automatically create unique run folders under `OUTPUT_DIR`.
