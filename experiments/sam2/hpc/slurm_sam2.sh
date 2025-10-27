@@ -36,7 +36,7 @@ cd "${HOME}/SegEdge"
 
 
 CHECKPOINT=${CHECKPOINT:-artifacts/checkpoints/sam2/models/sam2_hiera_large.pt}
-MODEL_CONFIG=/user/davide.mattioli/u20330/segment-anything-2/sam2/configs/sam2/sam2_hiera_l.yaml
+MODEL_CONFIG=/mnt/vast-standard/home/davide.mattioli/u20330/segment-anything-2/sam2/configs/sam2/sam2_hiera_l.yaml
 IMAGE_PATH=${IMAGE_PATH:-data/samples/imagery/1084-1393.tif}
 OUTPUT_DIR=${OUTPUT_DIR:-artifacts/outputs/sam2/hpc}
 PATCH_SIZE=${PATCH_SIZE:-2048}
