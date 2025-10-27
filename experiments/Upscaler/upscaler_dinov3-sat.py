@@ -146,7 +146,7 @@ def upsample_features(hr_image: torch.Tensor, lr_features: torch.Tensor, device:
     ).to(device).eval()  # Use GPU instead of CPU
 
     with torch.no_grad():
-        hr_features = upsampler(hr_image, lr_features, q_chunk_size=64)
+        hr_features = upsampler(hr_image, lr_features, q_chunk_size=4)
 
     print("hr_features shape:", tuple(hr_features.shape))
 
