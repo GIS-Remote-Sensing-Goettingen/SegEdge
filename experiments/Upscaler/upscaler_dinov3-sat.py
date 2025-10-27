@@ -207,7 +207,6 @@ def upsample_features(hr_image: torch.Tensor, lr_features: torch.Tensor, device:
     return hr_features
 
 
-
 def cluster_features(hr_features: torch.Tensor, n_clusters: int = 8):
     """
     Cluster upsampled features using k-means.
@@ -221,34 +220,43 @@ def cluster_features(hr_features: torch.Tensor, n_clusters: int = 8):
     """
     B, C, H, W = hr_features.shape
 
-    # we'll cluster in feature space, so build a 2D matrix X = (num_pixels × feature_dim)
+    # Reshape to (num_pixels, feature_dim)
     X = hr_features.permute(0, 2, 3, 1).reshape(B, -1, C)
     print("X shape:", X.shape)
 
-    # L2-normalize each patch vector so distance ~ cosine distance
-    # (helps k-means separate textures like roads/roofs)
-    X = X[0].detach().cpu().numpy().astype("float32")
-    X /= (np.linalg.norm(X, axis=1, keepdims=True) + 1e-8)
+    # Move to CPU and convert to numpy
+    X = X[0].cpu().numpy().astype("float32")
 
-    # print sanity checks before clustering
-    print("X shape:", X.shape, " mean L2 norm:", float(np.linalg.norm(X, axis=1).mean()))
+    # L2-normalize in chunks to avoid memory issues
+    print("Normalizing features in batches...")
+    chunk_size = 100000  # Process 100k vectors at a time
+    num_chunks = (X.shape[0] + chunk_size - 1) // chunk_size
 
-    # we'll use MiniBatchKMeans to group similar patch embeddings
-    # (fast, memory-friendly) into k semantic clusters
-    # choose an initial cluster count (k=8 is a reasonable start to separate
-    # roads/roofs/veg/shadows etc.)
+    for i in range(num_chunks):
+        start_idx = i * chunk_size
+        end_idx = min((i + 1) * chunk_size, X.shape[0])
+
+        chunk = X[start_idx:end_idx]
+        norms = np.linalg.norm(chunk, axis=1, keepdims=True) + 1e-8
+        X[start_idx:end_idx] = chunk / norms
+
+        if (i + 1) % 10 == 0:
+            print(f"  Normalized {end_idx}/{X.shape[0]} vectors")
+
+    print("X shape:", X.shape, " mean L2 norm:", float(np.linalg.norm(X[:10000], axis=1).mean()))
+
+    # Use MiniBatchKMeans for memory efficiency
+    print(f"Running MiniBatchKMeans with {n_clusters} clusters...")
     kmeans = MiniBatchKMeans(
         n_clusters=n_clusters,
         random_state=8,
         batch_size=2048,
-        max_iter=100
+        max_iter=100,
+        verbose=1  # Show progress
     )
 
-    # run clustering on the L2-normalized embeddings to obtain one label per pixel (0..k-1)
     labels = kmeans.fit_predict(X)
 
-    # report how many pixels fell into each cluster so we can gauge balance
-    # before mapping to the image grid
     print("labels shape:", labels.shape, " | counts per cluster:",
           np.bincount(labels, minlength=n_clusters))
 
