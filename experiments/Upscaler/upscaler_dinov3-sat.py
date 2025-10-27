@@ -139,10 +139,12 @@ def upsample_features(hr_image: torch.Tensor, lr_features: torch.Tensor, device:
         Upsampled features (B, D, H, W)
     """
     _, _, H, W = hr_image.shape
-    tile_size = 128  # Process 512×512 tiles
+    tile_size = 512  # Process 512×512 tiles
+    min_tile_size = 64  # Minimum tile size to avoid padding errors
 
     print("Loading AnyUp model from cache...")
     upsampler = torch.hub.load("wimmerth/anyup", "anyup", force_reload=False).to(device).eval()
+    print("Loaded AnyUp model successfully!")
 
     hr_features_list = []
 
@@ -153,44 +155,57 @@ def upsample_features(hr_image: torch.Tensor, lr_features: torch.Tensor, device:
             h_end = min(i + tile_size, H)
             w_end = min(j + tile_size, W)
 
-            # Extract tiles and make them contiguous
-            hr_tile = hr_image[:, :, i:h_end, j:w_end].contiguous()
-            lr_tile = lr_features[:, :, i // 16:(h_end // 16), j // 16:(w_end // 16)].contiguous()
+            # Check if tile is too small
+            tile_h = h_end - i
+            tile_w = w_end - j
 
-            print(f"Processing tile [{i}:{h_end}, {j}:{w_end}] - HR: {hr_tile.shape}, LR: {lr_tile.shape}")
+            # If edge tile is too small, extend backwards to get minimum size
+            if tile_h < min_tile_size:
+                i_start = max(0, h_end - min_tile_size)
+            else:
+                i_start = i
+
+            if tile_w < min_tile_size:
+                j_start = max(0, w_end - min_tile_size)
+            else:
+                j_start = j
+
+            # Extract tiles and make them contiguous
+            hr_tile = hr_image[:, :, i_start:h_end, j_start:w_end].contiguous()
+            lr_tile = lr_features[:, :, i_start // 16:(h_end // 16), j_start // 16:(w_end // 16)].contiguous()
+
+            print(f"Processing tile [{i_start}:{h_end}, {j_start}:{w_end}] - HR: {hr_tile.shape}, LR: {lr_tile.shape}")
 
             # Process tile
             with torch.no_grad():
                 tile_features = upsampler(hr_tile, lr_tile, q_chunk_size=64)
 
+            # If we extended the tile, crop back to original boundary
+            if i_start < i or j_start < j:
+                crop_i = i - i_start if i_start < i else 0
+                crop_j = j - j_start if j_start < j else 0
+                tile_features = tile_features[:, :, crop_i:, crop_j:]
+
             row_features.append(tile_features)
 
         hr_features_list.append(torch.cat(row_features, dim=3))
 
+        # Print memory status after each row
         if torch.cuda.is_available():
-            device = torch.cuda.current_device()
-
-            # Total memory
-            total = torch.cuda.get_device_properties(device).total_memory / 1024 ** 3
-
-            # Currently allocated
-            allocated = torch.cuda.memory_allocated(device) / 1024 ** 3
-
-            # Reserved by PyTorch
-            reserved = torch.cuda.memory_reserved(device) / 1024 ** 3
-
-            # Free memory (approximation)
+            device_id = torch.cuda.current_device()
+            total = torch.cuda.get_device_properties(device_id).total_memory / 1024 ** 3
+            allocated = torch.cuda.memory_allocated(device_id) / 1024 ** 3
+            reserved = torch.cuda.memory_reserved(device_id) / 1024 ** 3
             free = total - allocated
 
-            print(f"Total: {total:.2f} GB")
-            print(f"Allocated: {allocated:.2f} GB")
-            print(f"Reserved: {reserved:.2f} GB")
-            print(f"Free: {free:.2f} GB")
+            print(f"GPU Memory - Total: {total:.2f} GB | Allocated: {allocated:.2f} GB | "
+                  f"Reserved: {reserved:.2f} GB | Free: {free:.2f} GB")
 
     hr_features = torch.cat(hr_features_list, dim=2)
     print("Final hr_features shape:", tuple(hr_features.shape))
 
     return hr_features
+
 
 
 def cluster_features(hr_features: torch.Tensor, n_clusters: int = 8):
