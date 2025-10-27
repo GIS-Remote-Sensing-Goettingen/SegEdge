@@ -34,7 +34,6 @@ nvcc -V
 
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
 
-export PYTHONPATH="${PWD}/src:${PYTHONPATH}"
 
 CHECKPOINT=${CHECKPOINT:-artifacts/checkpoints/sam2/models/sam2_hiera_large.pt}
 MODEL_CONFIG=${MODEL_CONFIG:-third_party/sam2/sam2/configs/sam2/sam2_hiera_l.yaml}
@@ -45,7 +44,7 @@ OVERLAP=${OVERLAP:-128}
 
 mkdir -p "${OUTPUT_DIR}"
 
-python -u experiments/sam2/hpc/tiling_mask_generator.py \
+python -u tiling_mask_generator.py \
   --image "${IMAGE_PATH}" \
   --checkpoint "${CHECKPOINT}" \
   --model-config "${MODEL_CONFIG}" \
