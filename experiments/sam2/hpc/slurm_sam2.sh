@@ -44,7 +44,7 @@ OVERLAP=${OVERLAP:-128}
 
 mkdir -p "${OUTPUT_DIR}"
 
-python -u /experiments/sam2/hpc/tiling_mask_generator.py \
+python -u experiments/sam2/hpc/tiling_mask_generator.py \
   --image "${IMAGE_PATH}" \
   --checkpoint "${CHECKPOINT}" \
   --model-config "${MODEL_CONFIG}" \
