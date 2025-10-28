@@ -120,13 +120,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--points-per-side",
         type=int,
-        default=64,
+        default=256,
         help="SAM2 mask generator parameter: points per side of grid."
     )
     parser.add_argument(
         "--points-per-batch",
         type=int,
-        default=32,
+        default=128,
         help="SAM2 mask generator parameter: batch size for point processing."
     )
     parser.add_argument(
