@@ -10,6 +10,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+from hydra import initialize_config_dir, compose
 from matplotlib import pyplot as plt
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -441,7 +442,7 @@ if __name__ == '__main__':
     logger.info("=" * 80)
     t_start = time.time()
 
-    # GPU setup - but DO NOT enter global autocast context
+    # GPU setup
     if torch.cuda.is_available():
         props = torch.cuda.get_device_properties(0)
         logger.info(f"[MODEL] GPU device properties: {props}")
@@ -468,31 +469,32 @@ if __name__ == '__main__':
 
     logger.info("[MODEL] Building SAM2 model")
 
-    from pathlib import Path
-    from hydra import compose, initialize_config_dir
+    from hydra import initialize_config_dir
+    from hydra.core.global_hydra import GlobalHydra
+    from sam2.build_sam import build_sam2
 
+    # Clear any existing Hydra instance
+    if GlobalHydra.instance().is_initialized():
+        GlobalHydra.instance().clear()
 
-    def build_sam2(config_name_or_path: str, checkpoint: str, device="cuda", apply_postprocessing=False):
-        p = Path(config_name_or_path)
-        if p.suffix in (".yaml", ".yml") and p.exists():
-            # it’s a file path → use initialize_config_dir
-            with initialize_config_dir(version_base=None, config_dir=str(p.parent)):
-                cfg = compose(config_name=p.stem, overrides=[])
-        else:
-            # treat as config name in Hydra search path
-            cfg = compose(config_name=config_name_or_path, overrides=[])
-        # then proceed to build the model
+    config_name = config_path.stem  # e.g., "sam2_hiera_l"
+    config_dir = str(config_path.parent)  # Directory containing the config
 
-        model = build_sam2(cfg, checkpoint=checkpoint, device=device, apply_postprocessing=apply_postprocessing)
+    logger.info(f"[MODEL] Config directory: {config_dir}")
+    logger.info(f"[MODEL] Config name: {config_name}")
 
+    # Initialize Hydra context, then build model
+    with initialize_config_dir(version_base=None, config_dir=config_dir):
+        sam2_model = build_sam2(
+            config_file=config_name,
+            ckpt_path=str(checkpoint_path),
+            device=str(DEVICE),
+            apply_postprocessing=False
+        )
 
-
-        return model
-
-
-    sam2_model = build_sam2(str(config_path), str(checkpoint_path), device=DEVICE, apply_postprocessing=False)
-
+    # Continue with the rest of your code...
     logger.info("[MODEL] Instantiating mask generator")
+
     mask_generator_2 = SAM2AutomaticMaskGenerator(
         model=sam2_model,
         points_per_side=cli_args.points_per_side,
