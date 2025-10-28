@@ -460,7 +460,7 @@ def load_image_rasterio(image_path: Path, rgb_order: list) -> Tuple[np.ndarray, 
         # Select appropriate channels
         if src.count >= 3:
             # Take first 3 channels as RGB
-            rgb_data = data[rgb_order[::-1], :, :]
+            rgb_data = data[rgb_order, :, :]
         elif src.count == 1:
             # Replicate grayscale to 3 channels
             rgb_data = np.repeat(data, 3, axis=0)
@@ -1408,7 +1408,7 @@ def run_segmentation_pipeline(args: argparse.Namespace) -> None:
     config_path = args.model_config.expanduser().resolve()
     image_path = args.image.expanduser().resolve()
     output_root = args.output_dir.expanduser().resolve()
-    rgb_order = [6 ,4 ,2 ]
+    rgb_order = [5, 3, 1]
     validate_paths(checkpoint_path, config_path, image_path)
 
     # ========================================================================
