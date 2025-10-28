@@ -467,12 +467,30 @@ if __name__ == '__main__':
         raise FileNotFoundError(f"Image not found: {image_path}")
 
     logger.info("[MODEL] Building SAM2 model")
-    sam2_model = build_sam2(
-        str(config_path),
-        str(checkpoint_path),
-        device=DEVICE,
-        apply_postprocessing=False,
-    )
+
+    from pathlib import Path
+    from hydra import compose, initialize_config_dir
+
+
+    def build_sam2(config_name_or_path: str, checkpoint: str, device="cuda", apply_postprocessing=False):
+        p = Path(config_name_or_path)
+        if p.suffix in (".yaml", ".yml") and p.exists():
+            # it’s a file path → use initialize_config_dir
+            with initialize_config_dir(version_base=None, config_dir=str(p.parent)):
+                cfg = compose(config_name=p.stem, overrides=[])
+        else:
+            # treat as config name in Hydra search path
+            cfg = compose(config_name=config_name_or_path, overrides=[])
+        # then proceed to build the model
+
+        model = build_sam2(cfg, checkpoint=checkpoint, device=device, apply_postprocessing=apply_postprocessing)
+
+
+
+        return model
+
+
+    sam2_model = build_sam2(str(config_path), str(checkpoint_path), device=DEVICE, apply_postprocessing=False)
 
     logger.info("[MODEL] Instantiating mask generator")
     mask_generator_2 = SAM2AutomaticMaskGenerator(
