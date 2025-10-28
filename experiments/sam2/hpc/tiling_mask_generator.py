@@ -126,7 +126,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--points-per-batch",
         type=int,
-        default=128,
+        default=64,
         help="SAM2 mask generator parameter: batch size for point processing."
     )
     parser.add_argument(
