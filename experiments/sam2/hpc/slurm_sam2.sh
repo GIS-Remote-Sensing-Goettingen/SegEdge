@@ -3,6 +3,7 @@
 #SBATCH --job-name=sam2_mask_tiling
 #SBATCH --output=sam2_mask_tiling.out
 #SBATCH --error=sam2_mask_tiling.err
+#SBATCH --mem=128G
 
 #SBATCH -t 01:00:00                  # Estimated time, adapt to your needs
 
