@@ -108,7 +108,7 @@ if __name__ == "__main__":
         root=lr_tif,  # use the exact same path you just wrote
         model=model,
         window_size=(128, 128),
-        factor=8,
+        factor=4,
         overlap=12,
         eliminate_border_px=2,
         device=device,
