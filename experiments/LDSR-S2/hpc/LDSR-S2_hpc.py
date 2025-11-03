@@ -46,7 +46,7 @@ if __name__ == "__main__":
         import cubo
         import xarray as xr
         import rioxarray  # activates .rio accessor
-
+        print("CUBO version:", cubo.__version__)
         # 1) Create cube: RGBNIR in S2 L2A
         da = cubo.create(
             lat=lat, lon=lon,
