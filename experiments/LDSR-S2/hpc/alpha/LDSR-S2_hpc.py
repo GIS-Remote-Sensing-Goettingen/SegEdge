@@ -100,7 +100,7 @@ if __name__ == "__main__":
         edge_size=512,  # 128 in your case
         resolution=10,
         image_index=0,
-        out_path="./input_LR_image.tif",
+        out_path="input_LR_image.tif",
         as_uint16=True, nodata=0,
     )
 
