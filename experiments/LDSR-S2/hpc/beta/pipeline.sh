@@ -12,7 +12,7 @@ LATITUDE=${LATITUDE:-51.5413}
 LONGITUDE=${LONGITUDE:-9.9158}
 START_DATE=${START_DATE:-2025-04-14}
 END_DATE=${END_DATE:-2025-04-30}
-EDGE_SIZE=${EDGE_SIZE:-512}
+EDGE_SIZE=${EDGE_SIZE:-1024}  # pixels
 RESOLUTION=${RESOLUTION:-10}
 ENV_PATH="${SEGEDGE_CONDA_ENV:-/mnt/vast-standard/home/davide.mattioli/u20330/all}"
 # -----------------------------------------------------
