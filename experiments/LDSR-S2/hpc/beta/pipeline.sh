@@ -40,5 +40,5 @@ python -u stage_s2_cutout.py \
 # - We export INPUT_TIF and OUTPUT_DIR into the job env.
 JOB_ID=$(sbatch --chdir "$PWD" \
   --export=ALL,INPUT_TIF="$(realpath "${INPUT_TIF}")",OUTPUT_DIR="$(realpath "${OUTPUT_DIR}")" \
-  sr_job.sbatch | awk '{print $4}')
+  sr_job.sh | awk '{print $4}')
 echo "Submitted job ${JOB_ID}. SLURM files will appear here."
