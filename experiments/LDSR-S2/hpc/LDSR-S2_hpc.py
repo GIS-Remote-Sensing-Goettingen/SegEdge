@@ -97,10 +97,10 @@ if __name__ == "__main__":
     lr_tif = cubo_to_rgbnir_geotiff(
         lat=LATITUDE, lon=LONGITUDE,
         start_date=START_DATE, end_date=END_DATE,
-        edge_size=128,  # 128 in your case
+        edge_size=512,  # 128 in your case
         resolution=10,
         image_index=0,
-        out_path="/home/mak/PycharmProjects/SegEdge/experiments/LDSR-S2/hpc/input_LR_image.tif",
+        out_path="./input_LR_image.tif",
         as_uint16=True, nodata=0,
     )
 
