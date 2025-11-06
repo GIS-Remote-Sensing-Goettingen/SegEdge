@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=SR_sentinel2
-#SBATCH --output=SR_sentinel2.out
-#SBATCH --error=SR_sentinel2.err
+#SBATCH --output=SR_sentinel2_%j.out
+#SBATCH --error=SR_sentinel2_%j.err
 #SBATCH --mem=128G
 #SBATCH --time=01:30:00
 #SBATCH --partition=scc-gpu

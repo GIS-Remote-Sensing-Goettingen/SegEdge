@@ -6,8 +6,8 @@ set -euo pipefail
 # --- defaults (all relative to current directory) ---
 WORKDIR="$(pwd)"                          # ← your request
 DATA_DIR="${WORKDIR}/data_sentinel2"
-OUTPUT_DIR="${WORKDIR}/outputs"
-LOG_DIR="${WORKDIR}/logs"
+OUTPUT_ROOT="${WORKDIR}/outputs"
+LOG_ROOT="${WORKDIR}/logs"
 LATITUDE=${LATITUDE:-51.5413}
 LONGITUDE=${LONGITUDE:-9.9158}
 START_DATE=${START_DATE:-2025-04-14}
@@ -17,7 +17,12 @@ RESOLUTION=${RESOLUTION:-10}
 ENV_PATH="${SEGEDGE_CONDA_ENV:-/mnt/vast-standard/home/davide.mattioli/u20330/all}"
 # -----------------------------------------------------
 
-mkdir -p "${DATA_DIR}" "${OUTPUT_DIR}" "${LOG_DIR}"
+printf -v PATCH_STEM 'patch_lat_%0.6f_lon_%0.6f_edge_%d' "${LATITUDE}" "${LONGITUDE}" "${EDGE_SIZE}"
+OUTPUT_DIR="${OUTPUT_ROOT}/${PATCH_STEM}"
+LOG_DIR="${LOG_ROOT}/${PATCH_STEM}"
+
+mkdir -p "${DATA_DIR}" "${OUTPUT_ROOT}" "${LOG_ROOT}"
+mkdir -p "${OUTPUT_DIR}" "${LOG_DIR}"
 
 # Activate environment (login node)
 module load miniforge3 || true
@@ -39,6 +44,6 @@ python -u stage_s2_cutout.py \
 # - sbatch inherits current working dir by default, but we also pass --chdir for clarity.
 # - We export INPUT_TIF and OUTPUT_DIR into the job env.
 JOB_ID=$(sbatch --chdir "$PWD" \
-  --export=ALL,INPUT_TIF="$(realpath "${INPUT_TIF}")",OUTPUT_DIR="$(realpath "${OUTPUT_DIR}")" \
+  --export=ALL,INPUT_TIF="$(realpath "${INPUT_TIF}")",OUTPUT_DIR="$(realpath "${OUTPUT_DIR}")",LOG_DIR="$(realpath "${LOG_DIR}")" \
   sr_job.sh | awk '{print $4}')
 echo "Submitted job ${JOB_ID}. SLURM files will appear here."

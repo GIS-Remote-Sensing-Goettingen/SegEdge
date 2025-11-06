@@ -22,7 +22,7 @@ import sys
 from dataclasses import dataclass
 from typing import Iterable, List
 
-PIXEL_SIZE_METERS = 2.5  # Sentinel-2 pixel size in meters for this workflow
+DEFAULT_RESOLUTION_METERS = 10.0  # Default Sentinel-2 pixel size (meters) at 10 m resolution
 OVERLAP_METERS = 128.0  # Requested overlap between adjacent patches
 
 
@@ -111,7 +111,7 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     ap.add_argument(
         "--resolution",
         type=int,
-        help="Override RESOLUTION passed to pipeline.sh (optional).",
+        help="Override RESOLUTION passed to pipeline.sh (meters per pixel; default: 10).",
     )
     ap.add_argument(
         "--env-path",
@@ -289,6 +289,7 @@ def build_patches(
     lat2: float,
     lon2: float,
     edge_size: int,
+    resolution_m: float,
 ) -> List[Patch]:
     """
     Expand the bounding box into a list of patch descriptors.
@@ -296,7 +297,7 @@ def build_patches(
     Steps
     -----
     1. Normalize corner inputs into north/south and west/east extremes.
-    2. Translate the pixel edge size into physical meters and angular degrees.
+    2. Translate the pixel edge size into physical meters and angular degrees using ``resolution_m``.
     3. Compute latitude centers, then per-row longitude centers with overlap.
     4. Create :class:`Patch` instances for every grid position.
 
@@ -306,19 +307,21 @@ def build_patches(
         lat2: Latitude of the opposite extreme corner (degrees).
         lon2: Longitude of the opposite extreme corner (degrees).
         edge_size: Patch edge length in pixels.
+        resolution_m: Pixel size in meters used to convert the edge into ground distance.
 
     Returns:
         list[Patch]: Patches ordered row-wise (north to south, west to east).
 
     Examples
     --------
-    >>> patches = build_patches(0.0, 0.0, 0.0, 0.0, 512)
+    >>> patches = build_patches(0.0, 0.0, 0.0, 0.0, 512, 10.0)
     [DEBUG] Bounding box (lat): 0.0 → 0.0
     [DEBUG] Bounding box (lon): 0.0 → 0.0
-    [DEBUG] Patch size (meters): 1280.0
-    [DEBUG] Patch size (deg lat): 0.011498383039885016
+    [DEBUG] Pixel resolution (meters): 10.0
+    [DEBUG] Patch size (meters): 5120.0
+    [DEBUG] Patch size (deg lat): 0.045993532159540065
     [DEBUG] Estimated number of latitude rows: 1
-    [DEBUG] Row 1/1: lat_center=0.000000, patch_lon_deg=0.011498, lon_step_deg=0.010349, lon columns=1
+    [DEBUG] Row 1/1: lat_center=0.000000, patch_lon_deg=0.045994, lon_step_deg=0.044844, lon columns=1
     >>> len(patches)
     1
     """
@@ -329,7 +332,14 @@ def build_patches(
     if edge_size <= 0:
         raise ValueError(f"EDGE_SIZE must be positive; received {edge_size}.")
 
-    patch_size_m = edge_size * PIXEL_SIZE_METERS
+    if resolution_m <= 0:
+        raise ValueError(f"resolution_m must be positive; received {resolution_m}.")
+
+    print("[DEBUG] Bounding box (lat):", lat_min, "→", lat_max)
+    print("[DEBUG] Bounding box (lon):", lon_min, "→", lon_max)
+    print("[DEBUG] Pixel resolution (meters):", resolution_m)
+
+    patch_size_m = edge_size * resolution_m
     if OVERLAP_METERS >= patch_size_m:
         raise ValueError(
             f"Overlap {OVERLAP_METERS} m must be smaller than patch size {patch_size_m} m."
@@ -343,8 +353,6 @@ def build_patches(
 
     patches: List[Patch] = []
 
-    print("[DEBUG] Bounding box (lat):", lat_min, "→", lat_max)
-    print("[DEBUG] Bounding box (lon):", lon_min, "→", lon_max)
     print("[DEBUG] Patch size (meters):", patch_size_m)
     print("[DEBUG] Patch size (deg lat):", patch_lat_deg)
     print("[DEBUG] Estimated number of latitude rows:", lat_rows)
@@ -415,6 +423,7 @@ def run_patch(
     ...     pipeline = "pipeline.sh"
     ...     start_date = end_date = resolution = env_path = None
     ...     dry_run = False
+    ...     resolution_m = 10.0
     >>> run_patch(dummy_patch, DummyArgs(), 1, 1)  # doctest: +SKIP
     """
     # Resolve the pipeline path so we can change directories safely.
@@ -429,11 +438,13 @@ def run_patch(
 
     pipeline_dir = os.path.dirname(pipeline_path) or "."
     env = os.environ.copy()
+    resolved_resolution = int(round(args.resolution_m))
     env.update(
         {
             "LATITUDE": f"{patch.latitude:.8f}",
             "LONGITUDE": f"{patch.longitude:.8f}",
             "EDGE_SIZE": str(patch.edge_size),
+            "RESOLUTION": str(resolved_resolution),
         }
     )
 
@@ -441,8 +452,6 @@ def run_patch(
         env["START_DATE"] = args.start_date
     if args.end_date:
         env["END_DATE"] = args.end_date
-    if args.resolution:
-        env["RESOLUTION"] = str(args.resolution)
     if args.env_path:
         env["SEGEDGE_CONDA_ENV"] = args.env_path
 
@@ -452,7 +461,8 @@ def run_patch(
         f"col {patch.column_index + 1}/{patch.column_count})"
     )
     print(
-        f"[INFO] LAT={patch.latitude:.6f}, LON={patch.longitude:.6f}, EDGE_SIZE={patch.edge_size}"
+        f"[INFO] LAT={patch.latitude:.6f}, LON={patch.longitude:.6f}, "
+        f"EDGE_SIZE={patch.edge_size}, RESOLUTION={resolved_resolution}"
     )
     print(f"[INFO] Working directory for pipeline.sh: {pipeline_dir}")
 
@@ -499,7 +509,16 @@ def main(argv: Iterable[str]) -> int:
 
     print("[DEBUG] Parsed arguments:", args)
 
-    patches = build_patches(args.lat1, args.lon1, args.lat2, args.lon2, args.edge_size)
+    resolution_m = float(args.resolution) if args.resolution is not None else DEFAULT_RESOLUTION_METERS
+    args.resolution_m = resolution_m
+    patches = build_patches(
+        args.lat1,
+        args.lon1,
+        args.lat2,
+        args.lon2,
+        args.edge_size,
+        resolution_m,
+    )
     print(f"[INFO] Total patches to process: {len(patches)}")
 
     if args.dry_run:
