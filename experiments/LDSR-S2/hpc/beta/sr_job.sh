@@ -5,7 +5,7 @@
 #SBATCH --mem=128G
 #SBATCH --time=01:30:00
 #SBATCH --partition=scc-gpu
-#SBATCH --gres=gpu:1
+#SBATCH --gres=a100:1
 
 set -euo pipefail
 
@@ -37,3 +37,4 @@ python -u run_sr.py \
   --gpus 0 \
   --save-preview \
   | tee "${LOG_DIR}/job_${SLURM_JOB_ID}.log"
+
