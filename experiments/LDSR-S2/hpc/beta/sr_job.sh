@@ -5,7 +5,7 @@
 #SBATCH --mem=128G
 #SBATCH --time=01:30:00
 #SBATCH --partition=scc-gpu
-#SBATCH --gres=gpu:a100:1
+#SBATCH -G A100:1
 
 set -euo pipefail
 
