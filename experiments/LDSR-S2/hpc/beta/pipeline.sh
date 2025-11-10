@@ -3,11 +3,10 @@
 
 set -euo pipefail
 
-# --- defaults (all relative to current directory) ---
-WORKDIR="$(pwd)"                          # ← your request
-DATA_DIR="${WORKDIR}/data_sentinel2"
-OUTPUT_ROOT="${WORKDIR}/outputs"
-LOG_ROOT="${WORKDIR}/logs"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKDIR_ROOT="${WORKDIR_ROOT:-${SCRIPT_DIR}}"
+
+# --- defaults (all relative to per-patch working directory) ---
 LATITUDE=${LATITUDE:-51.5413}
 LONGITUDE=${LONGITUDE:-9.9158}
 START_DATE=${START_DATE:-2025-04-27}
@@ -18,11 +17,12 @@ ENV_PATH="${SEGEDGE_CONDA_ENV:-/mnt/vast-standard/home/davide.mattioli/u20330/al
 # -----------------------------------------------------
 
 printf -v PATCH_STEM 'patch_lat_%0.6f_lon_%0.6f_edge_%d' "${LATITUDE}" "${LONGITUDE}" "${EDGE_SIZE}"
-OUTPUT_DIR="${OUTPUT_ROOT}/${PATCH_STEM}"
-LOG_DIR="${LOG_ROOT}/${PATCH_STEM}"
+PATCH_ROOT="${WORKDIR_ROOT}/${PATCH_STEM}"
+DATA_DIR="${PATCH_ROOT}/data_sentinel2"
+OUTPUT_DIR="${PATCH_ROOT}/outputs"
+LOG_DIR="${PATCH_ROOT}/logs"
 
-mkdir -p "${DATA_DIR}" "${OUTPUT_ROOT}" "${LOG_ROOT}"
-mkdir -p "${OUTPUT_DIR}" "${LOG_DIR}"
+mkdir -p "${DATA_DIR}" "${OUTPUT_DIR}" "${LOG_DIR}"
 
 # Activate environment (login node)
 module load miniforge3 || true
@@ -41,9 +41,9 @@ python -u stage_s2_cutout.py \
 
 
 # Submit SR job, starting in THIS directory:
-# - sbatch inherits current working dir by default, but we also pass --chdir for clarity.
+# - Each patch gets an isolated working directory under PATCH_ROOT.
 # - We export INPUT_TIF and OUTPUT_DIR into the job env.
-JOB_ID=$(sbatch --chdir "$PWD" \
+JOB_ID=$(sbatch --chdir "${PATCH_ROOT}" \
   --export=ALL,INPUT_TIF="$(realpath "${INPUT_TIF}")",OUTPUT_DIR="$(realpath "${OUTPUT_DIR}")",LOG_DIR="$(realpath "${LOG_DIR}")" \
-  sr_job.sh | awk '{print $4}')
+  "${SCRIPT_DIR}/sr_job.sh" | awk '{print $4}')
 echo "Submitted job ${JOB_ID}. SLURM files will appear here."

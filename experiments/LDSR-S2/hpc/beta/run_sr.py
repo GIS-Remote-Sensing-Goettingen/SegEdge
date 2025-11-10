@@ -122,7 +122,8 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Device:", device)
-    cfg = OmegaConf.load(Path("config_10m.yaml"))
+    cfg_path = Path(__file__).with_name("config_10m.yaml")
+    cfg = OmegaConf.load(cfg_path)
 
     model = opensr_model.SRLatentDiffusion(cfg, device=device)
     model.load_pretrained(cfg.ckpt_version)

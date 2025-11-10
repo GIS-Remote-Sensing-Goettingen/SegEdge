@@ -3,11 +3,13 @@
 #SBATCH --output=SR_sentinel2_%j.out
 #SBATCH --error=SR_sentinel2_%j.err
 #SBATCH --mem=128G
-#SBATCH --time=01:30:00
+#SBATCH --time=01:00:00
 #SBATCH --partition=scc-gpu
 #SBATCH -G A100:1
 
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 module load miniforge3 gcc cuda
 # Activate env (allow override)
@@ -27,7 +29,7 @@ python --version
 python -m torch.utils.collect_env
 
 # Run the SR job on local files only (no internet needed)
-python -u run_sr.py \
+python -u "${SCRIPT_DIR}/run_sr.py" \
   --input-tif "${INPUT_TIF}" \
   --output-dir "${OUTPUT_DIR}" \
   --factor 4 \
@@ -37,4 +39,3 @@ python -u run_sr.py \
   --gpus 0 \
   --save-preview \
   | tee "${LOG_DIR}/job_${SLURM_JOB_ID}.log"
-
