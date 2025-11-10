@@ -4,7 +4,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORKDIR_ROOT="${WORKDIR_ROOT:-${SCRIPT_DIR}}"
+OUTPUT_BASE="${OUTPUT_BASE:-${SCRIPT_DIR}/output_patches}"
+mkdir -p "${OUTPUT_BASE}"
 
 # --- defaults (all relative to per-patch working directory) ---
 LATITUDE=${LATITUDE:-51.5413}
@@ -17,7 +18,7 @@ ENV_PATH="${SEGEDGE_CONDA_ENV:-/mnt/vast-standard/home/davide.mattioli/u20330/al
 # -----------------------------------------------------
 
 printf -v PATCH_STEM 'patch_lat_%0.6f_lon_%0.6f_edge_%d' "${LATITUDE}" "${LONGITUDE}" "${EDGE_SIZE}"
-PATCH_ROOT="${WORKDIR_ROOT}/${PATCH_STEM}"
+PATCH_ROOT="${OUTPUT_BASE}/${PATCH_STEM}"
 DATA_DIR="${PATCH_ROOT}/data_sentinel2"
 OUTPUT_DIR="${PATCH_ROOT}/outputs"
 LOG_DIR="${PATCH_ROOT}/logs"
