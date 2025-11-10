@@ -24,6 +24,10 @@ LOG_DIR="${PATCH_ROOT}/logs"
 
 mkdir -p "${DATA_DIR}" "${OUTPUT_DIR}" "${LOG_DIR}"
 
+# Copy SR runner assets into the patch workspace so jobs are self-contained.
+cp "${SCRIPT_DIR}/run_sr.py" "${PATCH_ROOT}/run_sr.py"
+cp "${SCRIPT_DIR}/config_10m.yaml" "${PATCH_ROOT}/config_10m.yaml"
+
 # Activate environment (login node)
 module load miniforge3 || true
 source activate "${ENV_PATH}"

@@ -9,8 +9,6 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
 module load miniforge3 gcc cuda
 # Activate env (allow override)
 source activate "${SEGEDGE_CONDA_ENV:-/mnt/vast-standard/home/davide.mattioli/u20330/all}"
@@ -28,8 +26,8 @@ nvidia-smi || true
 python --version
 python -m torch.utils.collect_env
 
-# Run the SR job on local files only (no internet needed)
-python -u "${SCRIPT_DIR}/run_sr.py" \
+# Run the SR job within the per-patch workspace
+python -u "./run_sr.py" \
   --input-tif "${INPUT_TIF}" \
   --output-dir "${OUTPUT_DIR}" \
   --factor 4 \
