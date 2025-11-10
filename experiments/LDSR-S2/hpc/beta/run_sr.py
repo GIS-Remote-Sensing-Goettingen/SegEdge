@@ -46,7 +46,7 @@ def compute_centroid_lat_lon(tif_path: Path) -> tuple[float, float]:
         return float(lat[0]), float(lon[0])
 
 
-def compress_and_rename(src_path: Path, lat: float, lon: float) -> Path:
+def compress_and_rename(src_path: Path, lat: float, lon: float, dest_dir: Path) -> Path:
     """
     Compress the SR output and rename it using the centroid coordinates.
 
@@ -60,18 +60,19 @@ def compress_and_rename(src_path: Path, lat: float, lon: float) -> Path:
         src_path: Path to the uncompressed SR GeoTIFF (typically ``sr.tif``).
         lat: Centroid latitude in decimal degrees.
         lon: Centroid longitude in decimal degrees.
+        dest_dir: Directory where the renamed file should be written.
 
     Returns:
         Path: Filesystem path to the compressed, renamed GeoTIFF.
 
     Examples
     --------
-    >>> compress_and_rename(Path("sr.tif"), 51.5, -0.12)  # doctest: +SKIP
+    >>> compress_and_rename(Path("sr.tif"), 51.5, -0.12, Path("outputs"))  # doctest: +SKIP
     PosixPath('output_SR_image_51.500000_-0.120000.tif')
     """
-    output_dir = src_path.parent
+    dest_dir.mkdir(parents=True, exist_ok=True)
     new_name = f"output_SR_image_{lat:.6f}_{lon:.6f}.tif"
-    new_path = output_dir / new_name
+    new_path = dest_dir / new_name
 
     print(f"[INFO] Compressing {src_path} → {new_path}")
     rio_copy(
@@ -155,7 +156,8 @@ def main():
 
     lat, lon = compute_centroid_lat_lon(final_sr_path)
     print(f"[INFO] Output centroid latitude: {lat:.6f}, longitude: {lon:.6f}")
-    new_path = compress_and_rename(final_sr_path, lat, lon)
+    output_dir = Path(args.output_dir)
+    new_path = compress_and_rename(final_sr_path, lat, lon, output_dir)
     print(f"[INFO] Final SR file available at: {new_path}")
 
 
