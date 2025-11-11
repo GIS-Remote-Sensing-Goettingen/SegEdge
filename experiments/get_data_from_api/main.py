@@ -32,7 +32,7 @@ GSD_M      = 0.2                 # 20 cm GSD target
 WIDTH      = HEIGHT = int(round(TILE_M / GSD_M))  # 1000 / 0.2 = 5000 px
 MAX_WORKERS = 12                  # tune: 4–8 is usually safe
 TIMEOUT_S   = 90
-OUT_DIR     = Path("patches_mt")
+OUT_DIR     = Path("/mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt")
 OUT_DIR.mkdir(exist_ok=True)
 LOG_FILE    = OUT_DIR / "download.log"
 
@@ -58,7 +58,7 @@ def make_session() -> requests.Session:
         "Connection": "keep-alive",
     })
     retry = Retry(
-        total=4,               # 1 initial + 4 retries
+        total=10,               # 1 initial + 4 retries
         backoff_factor=0.7,    # 0.7, 1.4, 2.8, 5.6 s (plus jitter internal to urllib3)
         status_forcelist=(502, 503, 504),
         allowed_methods=frozenset(["GET"]),
