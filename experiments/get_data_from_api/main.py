@@ -30,7 +30,7 @@ CRS_EPSG   = 25832
 TILE_M     = 1000                # 1 km × 1 km patches
 GSD_M      = 0.2                 # 20 cm GSD target
 WIDTH      = HEIGHT = int(round(TILE_M / GSD_M))  # 1000 / 0.2 = 5000 px
-MAX_WORKERS = 6                  # tune: 4–8 is usually safe
+MAX_WORKERS = 12                  # tune: 4–8 is usually safe
 TIMEOUT_S   = 90
 OUT_DIR     = Path("patches_mt")
 OUT_DIR.mkdir(exist_ok=True)
