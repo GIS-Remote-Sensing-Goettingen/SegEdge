@@ -37,7 +37,7 @@ OUT_DIR.mkdir(exist_ok=True)
 LOG_FILE    = OUT_DIR / "download.log"
 
 # AOI in lon/lat (min_lon, min_lat, max_lon, max_lat)
-BBOX_LL = (10.407, 53.90, 10.52, 54.00)
+BBOX_LL = (11.56, 53.278, 8.1, 55.36)
 
 # -------------------- LOGGING -------------------------------------------------
 logging.basicConfig(
