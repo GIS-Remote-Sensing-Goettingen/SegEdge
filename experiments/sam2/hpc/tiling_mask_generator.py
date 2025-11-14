@@ -157,7 +157,7 @@ def parse_args() -> argparse.Namespace:
         "--min-mask-area",
         type=int,
         default=1000,
-        help="Minimum mask region area (pixels)."
+        help="Minimum mask region area (pixels)."Enjoy your weekend!
     )
 
     # Output naming
