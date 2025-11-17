@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=SR_sentinel2
-#SBATCH --output=SR_sentinel2_%j.out
-#SBATCH --error=SR_sentinel2_%j.err
+#SBATCH --job-name=Coregister
+#SBATCH --output=cor.out
+#SBATCH --error=cor.err
 #SBATCH --mem=128G
-#SBATCH --time=01:00:00
+#SBATCH --time=00:20:00
 #SBATCH --partition=scc-gpu
 
 set -euo pipefail
