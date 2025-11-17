@@ -40,9 +40,10 @@ def main() -> None:
         str(ref_img),
         str(tgt_img),
         path_out=str(output_img),
+        window_size=(100,100),
         fmt_out="GTIFF",
         max_shift=40,
-        grid_res=50,
+        grid_res=900,
         q=False,
         progress=True,
     )

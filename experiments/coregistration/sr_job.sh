@@ -13,6 +13,11 @@ module load miniforge3
 source activate "${SEGEDGE_CONDA_ENV:-/mnt/vast-standard/home/davide.mattioli/u20330/all}"
 python --version
 
+# Explicitly set PROJ data directory
+export PROJ_DATA=/mnt/vast-standard/home/davide.mattioli/u20330/all/share/proj
 
-# Run the SR job within the per-patch workspace
-python -u "./coregister_with_arosics.py"
+# Verify it's set
+echo "PROJ_DATA is set to: $PROJ_DATA"
+ls -la $PROJ_DATA/proj.db
+
+python coregister_with_arosics.py
