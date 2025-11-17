@@ -2,6 +2,7 @@
 """
 Coregister two GeoTIFFs with AROSICS and report the applied alignment matrix.
 """
+from __future__ import annotations
 
 
 # CRITICAL: Set PROJ environment variables FIRST, before ANY imports
@@ -22,7 +23,6 @@ print(f"PROJ_DATA set to: {os.environ['PROJ_DATA']}")
 
 
 
-from __future__ import annotations
 
 import json
 from pathlib import Path
