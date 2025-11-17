@@ -2,27 +2,6 @@
 """
 Coregister two GeoTIFFs with AROSICS and report the applied alignment matrix.
 """
-from __future__ import annotations
-
-
-# CRITICAL: Set PROJ environment variables FIRST, before ANY imports
-import os
-import sys
-
-# Set the PROJ data directory (use the correct path from your environment)
-PROJ_DATA_PATH = "/mnt/vast-standard/home/davide.mattioli/u20330/all/share/proj"
-os.environ['PROJ_DATA'] = PROJ_DATA_PATH
-os.environ['PROJ_LIB'] = PROJ_DATA_PATH
-
-# Verify before proceeding
-if not os.path.exists(os.path.join(PROJ_DATA_PATH, "proj.db")):
-    print(f"ERROR: proj.db not found at {PROJ_DATA_PATH}", file=sys.stderr)
-    sys.exit(1)
-
-print(f"PROJ_DATA set to: {os.environ['PROJ_DATA']}")
-
-
-
 
 import json
 from pathlib import Path
@@ -43,16 +22,10 @@ def translation_matrix(dx: float, dy: float) -> List[List[float]]:
 def main() -> None:
 
 
-    workdir = Path(__file__).resolve().parent
-    ref_img = workdir / "20240724_noon_orthomosaic_rgb.tif"
-    tgt_img = workdir / "20240724_noon_orthomosaic_tir.tif"
+    ref_img = "20240724_noon_orthomosaic_rgb.tif"
+    tgt_img =  "20240724_noon_orthomosaic_tir.tif"
 
-    if not ref_img.exists() or not tgt_img.exists():
-        raise SystemExit(
-            f"Expected both {ref_img.name} and {tgt_img.name} to exist in {workdir}"
-        )
-
-    output_img = workdir / "20240724_noon_orthomosaic_tir_coreg.tif"
+    output_img = "20240724_noon_orthomosaic_tir_coreg.tif"
 
     # Allow larger displacements during matching to avoid false failures.
     coreg = COREG_LOCAL(
@@ -92,7 +65,7 @@ def main() -> None:
         "success": bool(info.get("success", True)),
     }
 
-    summary_path = workdir / "coregistration_summary.json"
+    summary_path = "coregistration_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2))
 
     print("Coregistration complete.")
