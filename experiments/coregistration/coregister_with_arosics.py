@@ -42,7 +42,7 @@ def main() -> None:
         path_out=str(output_img),
         fmt_out="GTIFF",
         max_shift=40,
-        grid_res=500,
+        grid_res=50,
         q=False,
         progress=True,
     )
