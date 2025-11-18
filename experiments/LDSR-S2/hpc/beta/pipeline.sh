@@ -14,7 +14,7 @@ START_DATE=${START_DATE:-2025-08-0}
 END_DATE=${END_DATE:-2025-08-30}
 EDGE_SIZE=${EDGE_SIZE:-4096}  # pixels
 RESOLUTION=${RESOLUTION:-10}
-ENV_PATH="${SEGEDGE_CONDA_ENV:-/mnt/vast-standard/home/davide.mattioli/u20330/all}"
+ENV_PATH="${SEGEDGE_CONDA_ENV:-/mnt/vast-standard/home/davide.mattioli/u20330/myenv}"
 # -----------------------------------------------------
 
 printf -v PATCH_STEM 'patch_lat_%0.6f_lon_%0.6f_edge_%d' "${LATITUDE}" "${LONGITUDE}" "${EDGE_SIZE}"

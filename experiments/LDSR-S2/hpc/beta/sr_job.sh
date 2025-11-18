@@ -11,7 +11,7 @@ set -euo pipefail
 
 module load miniforge3 gcc cuda
 # Activate env (allow override)
-source activate "${SEGEDGE_CONDA_ENV:-/mnt/vast-standard/home/davide.mattioli/u20330/all}"
+source activate "${SEGEDGE_CONDA_ENV:-/mnt/vast-standard/home/davide.mattioli/u20330/myenv}"
 
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
 
