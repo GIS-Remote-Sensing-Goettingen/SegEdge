@@ -22,7 +22,7 @@ def translation_matrix(dx: float, dy: float) -> List[List[float]]:
 def main() -> None:
 
 
-    ref_img = "20240724_noon_orthomosaic_rgb.tif"
+    ref_img = "20240724_evening_orthomosaic_tir.tif"
     tgt_img =  "20240724_noon_orthomosaic_tir.tif"
 
     output_img = "20240724_noon_orthomosaic_tir_coreg.tif"
@@ -32,10 +32,10 @@ def main() -> None:
         str(ref_img),
         str(tgt_img),
         path_out=str(output_img),
-        window_size=(100,100),
         fmt_out="GTIFF",
         max_shift=40,
-        grid_res=700,
+        max_points=700,
+        grid_res=200,
         q=False,
         progress=True,
     )
@@ -44,43 +44,10 @@ def main() -> None:
 
     # Cool infos
     info: Dict = coreg.coreg_info
-    px_dx = float(info["corrected_shifts_px"]["x"])
-    px_dy = float(info["corrected_shifts_px"]["y"])
-    map_dx = float(info["corrected_shifts_map"]["x"])
-    map_dy = float(info["corrected_shifts_map"]["y"])
-
-    matrices = {
-        "pixel_shift_matrix": translation_matrix(px_dx, px_dy),
-        "map_shift_matrix": translation_matrix(map_dx, map_dy),
-    }
-
-    #LOG
-    summary = {
-        "reference_image": str(ref_img.name),
-        "target_image": str(tgt_img.name),
-        "coregistered_image": str(output_img.name),
-        "pixel_shift": {"dx": px_dx, "dy": px_dy},
-        "map_shift_degrees": {"dx": map_dx, "dy": map_dy},
-        "affine_matrices": matrices,
-        "success": bool(info.get("success", True)),
-    }
-
-    summary_path = "coregistration_summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2))
-
-    print("Coregistration complete.")
-    print(f"  Reference image : {ref_img.name}")
-    print(f"  Target image    : {tgt_img.name}")
-    print(f"  Output image    : {output_img.name}")
-    print(f"  Pixel shift     : dx={px_dx:.4f} px, dy={px_dy:.4f} px (image  coordinates)"  )
-    print(f"  Map shift       : dx={map_dx:.8f}°, dy={map_dy:.8f}° (geographic coordinates)"
-    )
-    print("  Translation matrices:")
-    for name, matrix in matrices.items():
-        print(f"    {name}:")
-        for row in matrix:
-            print(f"      {row}")
-    print(f"  Summary saved to {summary_path.name}")
+    print(f"Success: {info['success']}")
+    print(f"Mean horizontal shift: {info['mean_shifts_px']['x']:.2f} pixels")
+    print(f"Mean vertical shift: {info['mean_shifts_px']['y']:.2f} pixels")
+    print(f"Total GCPs: {len(info['GCPList'])}")
 
 
 if __name__ == "__main__":
