@@ -1,8 +1,27 @@
 #!/usr/bin/env python
 import argparse, os, re
+from math import floor
 import numpy as np
 import cubo
 import rioxarray  # activates .rio accessor
+from pyproj import CRS
+
+def guess_utm_epsg(lat: float, lon: float) -> int:
+    """
+    Fallback: approximate UTM EPSG from latitude/longitude.
+
+    We assume WGS84 and compute the standard 6-degree zone. Values near poles
+    clamp to the maximum UTM-supported latitude (~84°N/S).
+    """
+    # Clamp latitude to valid UTM range
+    lat = max(min(lat, 84.0), -80.0)
+    zone = int(floor((lon + 180.0) / 6.0)) + 1
+    if lat >= 0:
+        epsg = 32600 + zone
+    else:
+        epsg = 32700 + zone
+    return epsg
+
 
 def cubo_to_rgbnir_geotiff(lat, lon, start_date, end_date,
                            edge_size, resolution, image_index,
@@ -20,9 +39,12 @@ def cubo_to_rgbnir_geotiff(lat, lon, start_date, end_date,
 
     epsg_text = str(da.attrs.get("epsg", "") or da.coords.get("epsg", ""))
     m = re.search(r"(\d{4,5})", epsg_text)
-    if not m:
-        raise RuntimeError(f"Could not parse EPSG from {epsg_text!r}")
-    da = da.rio.write_crs(int(m.group(1)), inplace=False)
+    if m:
+        epsg_code = int(m.group(1))
+    else:
+        epsg_code = guess_utm_epsg(lat, lon)
+        print(f"[WARN] Could not parse EPSG from {epsg_text!r}; using fallback {epsg_code}.")
+    da = da.rio.write_crs(int(epsg_code), inplace=False)
 
     arr = da
     if as_uint16:
