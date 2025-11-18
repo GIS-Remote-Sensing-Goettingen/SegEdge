@@ -33,6 +33,18 @@ cp "${SCRIPT_DIR}/config_10m.yaml" "${PATCH_ROOT}/config_10m.yaml"
 module load miniforge3 || true
 source activate "${ENV_PATH}"
 
+# Ensure pyproj finds its PROJ database even when running in isolated dirs.
+if [[ -z "${PROJ_LIB:-}" ]]; then
+  PROJ_LIB="$(python - <<'PY'
+from pyproj import datadir
+print(datadir.get_data_dir())
+PY
+)"
+  export PROJ_LIB
+  export PROJ_DATA="${PROJ_LIB}"
+fi
+export PROJ_NETWORK=ON
+
 # Stage LR GeoTIFF via cubo into current directory tree
 INPUT_TIF="${DATA_DIR}/input_LR_image_${LATITUDE}_${LONGITUDE}.tif"
 python -u stage_s2_cutout.py \
