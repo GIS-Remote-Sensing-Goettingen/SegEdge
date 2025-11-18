@@ -10,8 +10,8 @@ mkdir -p "${OUTPUT_BASE}"
 # --- defaults (all relative to per-patch working directory) ---
 LATITUDE=${LATITUDE:-51.5413}
 LONGITUDE=${LONGITUDE:-9.9158}
-START_DATE=${START_DATE:-2025-11-05}
-END_DATE=${END_DATE:-2025-11-08}
+START_DATE=${START_DATE:-2025-09-26}
+END_DATE=${END_DATE:-2025-09-30}
 EDGE_SIZE=${EDGE_SIZE:-4096}  # pixels
 RESOLUTION=${RESOLUTION:-10}
 ENV_PATH="${SEGEDGE_CONDA_ENV:-/mnt/vast-standard/home/davide.mattioli/u20330/all}"
