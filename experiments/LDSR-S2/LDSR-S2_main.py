@@ -63,10 +63,10 @@ if __name__ == "__main__":
     assert model.training == False, "Model has to be in eval mode."
 
     # Define Coordinates and Time
-    LATITUDE =51.5413
-    LONGITUDE = 9.9158
-    START_DATE = "2025-04-01"  # Set date (be mindful of cloud cover)
-    END_DATE = "2025-04-30"
+    LATITUDE =51.583974
+    LONGITUDE = 11.596080
+    START_DATE = "2025-08-18"  # Set date (be mindful of cloud cover)
+    END_DATE = "2025-08-20"
 
     # Get image - Shape needs to be Bx4x128x128
     lr = get_s2_scene(LATITUDE, LONGITUDE, START_DATE, END_DATE)
