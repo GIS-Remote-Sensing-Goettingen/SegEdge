@@ -473,7 +473,7 @@ def train_model(processed_dir, device):
     BATCH_SIZE = 4
     EPOCHS = 40  # More epochs for V2 as it has more parameters
     MUON_LR = 0.02
-    ADAMW_LR = 1e-3
+    ADAMW_LR = 1e-4
 
     dataset = PrecomputedDataset(processed_dir)
     train_size = int(0.8 * len(dataset))
