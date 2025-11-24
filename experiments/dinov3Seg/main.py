@@ -207,18 +207,50 @@ class ModelEMA:
 def prepare_phase(config: dict, logger: VerbosityLogger) -> None:
     """
     Run the tiling and feature-caching phase if enabled.
+
+    This phase is conceptually:
+      - INPUT:  raw imagery (big GeoTIFFs) + label raster
+      - OUTPUT: small .pt files with:
+                  * RGB tiles
+                  * labels per tile
+                  * precomputed DINO multiscale features
+      - PURPOSE: expensive I/O + DINO forward passes are done once,
+                 so train/inference can be fast and CPU/GPU friendly.
     """
 
+    # Check feature toggle in the config:
+    # if `prepare.enable: false`, we simply skip this phase.
     if not section_enabled(config, "prepare"):
         logger.debug("Prepare phase disabled.")
         return
+
+    # `section` contains only the "prepare" subsection of the config.
     section = config.get("prepare", {})
+
+    # Model config is needed because we must know which backbone and layers
+    # to use when extracting features during tiling.
     model_cfg = get_model_config(config)
+
+    # Resolve paths for:
+    #   - input image directory (raw patches or large rasters)
+    #   - label raster (same CRS/resolution as imagery)
+    #   - output directory for cached tiles (.pt)
     img_dir = resolve_path(config, section, "img_dir", DEFAULT_RAW_IMAGES_DIR)
     label_path = resolve_path(config, section, "label_path", DEFAULT_LABEL_PATH)
     output_dir = resolve_path(config, section, "output_dir", DEFAULT_PROCESSED_DIR)
+
+    # Device for feature extraction. Typically `cuda` for speed, but can be
+    # configured to `cpu` for systems without GPU.
     device = torch.device(section.get("device", DEFAULT_DEVICE))
+
+    # TimedBlock is a small profiling/logging helper so we can see how long
+    # the preparation phase takes (useful on large datasets).
     with TimedBlock(logger, "Preparation phase"):
+        # Core worker that does:
+        #   - sliding window over imagery
+        #   - alignment with labels
+        #   - backbone forward for feature extraction
+        #   - serializing everything into .pt files on disk
         prepare_data_tiles(
             img_dir=img_dir,
             label_path=label_path,
@@ -231,22 +263,44 @@ def prepare_phase(config: dict, logger: VerbosityLogger) -> None:
         )
 
 
+
 def verify_phase(config: dict, logger: VerbosityLogger) -> None:
     """
     Run cache verification if enabled.
+
+    This phase is conceptually:
+      - INPUT:  directory of cached .pt tiles
+      - OUTPUT: same directory, but with problematic tiles removed/fixed
+      - PURPOSE: catch corrupt files, shape mismatches, NaNs, etc.
+                 before training, so training loops don't crash after
+                 hours of work.
     """
 
+    # Again, controlled via `verify.enable` in the config. Skipped if off.
     if not section_enabled(config, "verify"):
         logger.debug("Verify phase disabled.")
         return
+
+    # Local section for "verify" config knobs.
     section = config.get("verify", {})
+
+    # Where cached tiles live. This usually matches the output_dir used in
+    # the preparation phase, but can be overridden.
     processed_dir = resolve_path(config, section, "processed_dir", DEFAULT_PROCESSED_DIR)
+
+    # Wrap the verification step in a timer for logging and profiling.
     with TimedBlock(logger, "Verification phase"):
+        # This helper will typically:
+        #   - iterate over .pt files
+        #   - try loading them
+        #   - validate basic invariants (shapes, dtypes, presence of keys)
+        #   - remove or log any broken tiles
         verify_and_clean_dataset_fast(
-        processed_dir,
-        num_workers=section.get("workers"),
-        logger=logger,
+            processed_dir,
+            num_workers=section.get("workers"),
+            logger=logger,
         )
+
 
 
 def create_dataloaders(
@@ -427,33 +481,85 @@ def build_tta_transforms(cfg: dict) -> List[TTATransform]:
 def train_phase(config: dict, logger: VerbosityLogger) -> None:
     """
     Train the configured segmentation head if enabled.
+
+    High-level:
+      - INPUT:  directory of cached tiles (RGB + features + labels)
+      - MODEL:  frozen DINO backbone, trainable segmentation head
+      - OUTPUT: .pth checkpoints in `weights_dir`
+      - PURPOSE: optimize only the segmentation head, using:
+                   * mixed loss (CE + Dice)
+                   * Muon optimizer for matrix params + AdamW for 1D params
+                   * OneCycleLR schedule
+                   * EMA and early stopping on mIoU
     """
 
+    # Feature toggle: only run if `train.enable: true`.
     if not section_enabled(config, "train"):
         logger.debug("Train phase disabled.")
         return
+
+    # `section` contains training-specific hyperparameters (batch size,
+    # learning rates, num_workers, etc.).
     section = config.get("train", {})
+
+    # Dataset-specific configuration:
+    #   - random vs explicit splits
+    #   - augmentation settings
     dataset_cfg = config.get("dataset", {})
+
+    # Backbone + head configuration (model name, layers, head type...).
     model_cfg = get_model_config(config)
+
+    # Location of cached tiles; falls back to global path or default if not
+    # explicitly set in `train`.
     processed_dir = resolve_path(config, section, "processed_dir", DEFAULT_PROCESSED_DIR)
+
+    # Directory to store model weights (.pth). Creates it if missing.
     weights_dir = section.get("weights_dir", "weights")
     os.makedirs(weights_dir, exist_ok=True)
+
+    # Compute device (typically `cuda`).
     device = torch.device(section.get("device", DEFAULT_DEVICE))
+
+    # Batch size for training. Can be small if GPU memory is constrained;
+    # gradient accumulation is used to simulate larger effective batch size.
     batch_size = section.get("batch_size", 4)
-    train_loader, val_loader = create_dataloaders(processed_dir, dataset_cfg, section, batch_size, logger)
+
+    # Build DataLoaders over cached tiles (train/val). These load precomputed
+    # tensors from disk instead of decoding GeoTIFFs at runtime.
+    train_loader, val_loader = create_dataloaders(
+        processed_dir, dataset_cfg, section, batch_size, logger
+    )
     logger.info(
         f"Dataset split: {len(train_loader.dataset)} train / {len(val_loader.dataset)} val tiles."
     )
+
+    # Instantiate the segmentation head (UNet, DinoUNet, etc.) according to
+    # config. The backbone is not created here because features are cached.
     model = build_head(
         model_cfg["head"],
         num_classes=model_cfg["num_classes"],
         dino_channels=model_cfg["dino_channels"],
     ).to(device)
+
+    # Optional compilation via torch.compile (where available), which can
+    # speed up training at the cost of a longer first iteration.
     if section.get("compile", False) and hasattr(torch, "compile"):
         model = torch.compile(model)
+
+    # Log number of trainable parameters; useful sanity check and for
+    # comparing different heads (full vs lite, etc.).
     total_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Initialized head '{model_cfg['head']}' with {total_params:,} parameters.")
+
+    # Split parameters by dimensionality:
+    #   - >=2D tensors (matrices/conv kernels) go to Muon optimizer
+    #   - 1D tensors (biases, LayerNorm weights) go to AdamW
     muon_params, adamw_params = split_params_for_muon(model)
+
+    # Construct the hybrid Muon + AdamW optimizer. Muon handles "matrix-like"
+    # parameters, AdamW handles 1D params. LR for each group can be tuned
+    # separately via config.
     optimizer = Muon(
         muon_params,
         lr=section.get("muon_lr", 0.02),
@@ -461,13 +567,23 @@ def train_phase(config: dict, logger: VerbosityLogger) -> None:
         adamw_params=adamw_params,
         adamw_lr=section.get("adamw_lr", 1e-3),
     )
+
+    # Compute how many optimizer steps happen per epoch, accounting for
+    # gradient accumulation. OneCycleLR needs this to shape the LR schedule.
     steps_per_epoch = math.ceil(len(train_loader) / max(1, section.get("grad_accum_steps", 1)))
+
+    # OneCycleLR: high initial LR ramp that decays over time, often working
+    # well with Muon/AdamW. Max LR reused from muon_lr for simplicity.
     scheduler = OneCycleLR(
         optimizer,
         max_lr=section.get("muon_lr", 0.02),
         epochs=section.get("epochs", 30),
         steps_per_epoch=steps_per_epoch,
     )
+
+    # Loss configuration:
+    #   - CE + Dice weighted combination
+    #   - optional class_weights, ignore_index, aux loss weight, etc.
     loss_cfg = section.get("loss", {})
     loss_fn = SegmentationLoss(
         num_classes=model_cfg["num_classes"],
@@ -477,66 +593,127 @@ def train_phase(config: dict, logger: VerbosityLogger) -> None:
         class_weights=loss_cfg.get("class_weights"),
         ignore_index=loss_cfg.get("ignore_index"),
     ).to(device)
+
+    # Automatic mixed precision (AMP) on GPU to speed up training and reduce
+    # memory; disabled on CPU for simplicity.
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler(device.type) if use_amp else None
     autocast = torch.amp.autocast(device_type=device.type) if use_amp else nullcontext()
+
+    # Path where the best model (by mIoU) will be stored.
     best_path = os.path.join(weights_dir, f"{model_cfg['head']}_best.pth")
+
+    # Early stopping monitors a metric (mIoU) and restores best checkpoint
+    # when no improvement beyond `min_delta` is observed for `patience` epochs.
     early_stopping = EarlyStopping(
         patience=section.get("patience", 10),
         min_delta=0.005,
         path=best_path,
         mode="max",
     )
+
+    # Optional EMA: maintain a smoothed copy of the model parameters, which
+    # often yields more stable validation performance.
     ema_decay = section.get("ema_decay", 0.0)
     ema = ModelEMA(model, ema_decay) if ema_decay > 0 else None
+
+    # Core training hyperparameters from config.
     epochs = section.get("epochs", 30)
     grad_accum = max(1, section.get("grad_accum_steps", 1))
+
     logger.info(f"Training for up to {epochs} epochs on device {device}.")
+
+    # The entire training loop is profiled with TimedBlock.
     with TimedBlock(logger, "Training phase"):
         global_step = 0
         for epoch in range(epochs):
+            # Time each epoch separately for finer-grained profiling.
             with TimedBlock(logger, f"Epoch {epoch + 1}"):
                 model.train()
                 train_loss = 0.0
+
+                # Zero gradients at the start of each epoch. With gradient
+                # accumulation, we call optimizer.step() less frequently.
                 optimizer.zero_grad()
+
+                # tqdm progress bar purely for user feedback during training.
                 pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs} [Train]", leave=False)
+
                 for batch_idx, (img, features, y) in enumerate(pbar, 1):
+                    # Move batched tiles + labels to the target device.
                     img = img.to(device)
                     y = y.to(device)
                     feats = move_features_to_device(features, device)
+
+                    # Use autocast for mixed precision when on GPU.
                     with autocast:
+                        # Some heads expose `forward_with_aux` for deep
+                        # supervision. If available, we use both main and aux.
                         if hasattr(model, "forward_with_aux"):
                             logits, aux_logits = model.forward_with_aux(img, feats)
                         else:
                             logits = model(img, feats)
                             aux_logits = None
+
+                        # Align label resolution to current logits (handles
+                        # heads that produce logits at lower resolution).
                         target_main = align_labels_to_logits(y, logits)
-                        target_aux = align_labels_to_logits(y, aux_logits) if aux_logits is not None else None
+                        target_aux = (
+                            align_labels_to_logits(y, aux_logits) if aux_logits is not None else None
+                        )
+
+                        # Compute composite loss (main + optional aux).
+                        # Divide by grad_accum so that effective gradient after
+                        # accumulating `grad_accum` steps matches the full batch.
                         loss = loss_fn(logits, target_main, aux_logits=aux_logits, aux_targets=target_aux)
                         loss = loss / grad_accum
+
+                    # Backprop: route through GradScaler if AMP is active.
                     if scaler:
                         scaler.scale(loss).backward()
                     else:
                         loss.backward()
+
+                    # Perform an optimizer step every `grad_accum` batches
+                    # or at the very end of the epoch.
                     if batch_idx % grad_accum == 0 or batch_idx == len(train_loader):
                         if scaler:
                             scaler.step(optimizer)
                             scaler.update()
                         else:
                             optimizer.step()
+
+                        # Reset gradients for the next accumulation window.
                         optimizer.zero_grad()
+
+                        # Advance LR schedule (OneCycle).
                         scheduler.step()
+
+                        # Update EMA weights if enabled.
                         if ema:
                             ema.update(model)
+
                         global_step += 1
+
+                    # Accumulate un-normalized loss for reporting.
                     train_loss += loss.item() * grad_accum
+
+                    # Optional debug logging every N batches to monitor loss
+                    # and current learning rate during training.
                     if batch_idx % 10 == 0:
                         logger.debug(
                             f"Epoch {epoch + 1}, batch {batch_idx}/{len(train_loader)} "
                             f"loss={loss.item() * grad_accum:.4f}, lr={scheduler.get_last_lr()[0]:.5f}"
                         )
+
+                # Average training loss over all batches.
                 avg_train_loss = train_loss / len(train_loader)
+
+                # Use EMA model for evaluation if present; otherwise use
+                # the raw model. This usually yields smoother validation metrics.
                 eval_model = ema.ema_model if ema else model
+
+                # Run full validation pass on cached tiles.
                 val_loss, val_metrics = evaluate(
                     eval_model,
                     val_loader,
@@ -546,75 +723,166 @@ def train_phase(config: dict, logger: VerbosityLogger) -> None:
                     logger,
                     model_cfg["num_classes"],
                 )
+
                 logger.info(
                     f"Epoch {epoch + 1} | Train Loss: {avg_train_loss:.4f} | "
                     f"Val Loss: {val_loss:.4f} | Val mIoU: {val_metrics['miou']:.4f}"
                 )
+
+                # Save a per-epoch checkpoint with val loss and mIoU encoded
+                # in the filename for easy manual inspection/comparison.
                 epoch_ckpt = os.path.join(
                     weights_dir,
                     f"{model_cfg['head']}_VALLOSS_{val_loss:.4f}_MIOU_{val_metrics['miou']:.4f}_EPOCH_{epoch + 1}.pth",
                 )
                 torch.save(eval_model.state_dict(), epoch_ckpt)
+
+                # Update early stopping using the monitored metric (mIoU).
+                # It will also keep track of and write the best model to `best_path`.
                 early_stopping(val_metrics["miou"], eval_model)
+
+                # Exit training loop early if no improvement for `patience` epochs.
                 if early_stopping.early_stop:
                     logger.info("Early stopping triggered.")
                     break
+
     logger.info(f"Training finished. Best weights saved to {best_path}")
 
 
 def inference_phase(config: dict, logger: VerbosityLogger) -> None:
     """
     Run sliding-window inference if enabled.
+
+    High-level:
+      - INPUT:   large input GeoTIFF (`input_tif`)
+      - MODEL:   DINO backbone + trained head (loaded from `checkpoint`)
+      - PROCESS: sliding-window tiling with optional TTA + probability fusion
+      - OUTPUT:  single-band prediction raster (`output_tif`)
+      - PURPOSE: scalable inference on large scenes that do not fit into
+                 GPU memory at once, while leveraging cached DINO features
+                 per tile (computed on the fly here).
     """
 
+    # Support both `inference` and legacy `infer` config keys. If neither is
+    # enabled, we exit early.
     infer_cfg = config.get("inference", config.get("infer", {}))
     if not infer_cfg or not infer_cfg.get("enable", False):
         logger.debug("Inference phase disabled.")
         return
+
+    # Model configuration (backbone name, feature layers, head type, etc.).
     model_cfg = get_model_config(config)
+
+    # Device for inference; often `cuda`, but can be overridden in config.
     device = torch.device(infer_cfg.get("device", DEFAULT_DEVICE))
+
+    # Hugging Face processor + backbone for DINO. We only need the encoder
+    # (AutoModel), not the classification head.
     processor = AutoImageProcessor.from_pretrained(model_cfg["backbone"])
     backbone = AutoModel.from_pretrained(model_cfg["backbone"]).eval().to(device)
-    head = build_head(model_cfg["head"], num_classes=model_cfg["num_classes"], dino_channels=model_cfg["dino_channels"]).to(device)
+
+    # Build the segmentation head with the same interface used in training.
+    head = build_head(
+        model_cfg["head"],
+        num_classes=model_cfg["num_classes"],
+        dino_channels=model_cfg["dino_channels"],
+    ).to(device)
+
+    # Load the trained weights; `checkpoint` is typically the best model
+    # selected by early stopping, but can be any .pth path.
     checkpoint = infer_cfg["checkpoint"]
     logger.info(f"Loading checkpoint {checkpoint}")
     state_dict = torch.load(checkpoint, map_location=device)
+    # `strict=False` allows missing/extra keys (e.g. EMA buffers, different
+    # deep supervision heads) without crashing.
     head.load_state_dict(state_dict, strict=False)
     head.eval()
+
+    # Input and output rasters:
+    #   - input_tif: large RGB image
+    #   - output_tif: predictions (1 band: class index per pixel)
     input_tif = infer_cfg["input_tif"]
     output_tif = infer_cfg["output_tif"]
+
+    # Tile size for sliding window. Only the tile must fit in GPU memory,
+    # not the whole image.
     tile_size = infer_cfg.get("tile_size", 512)
+
+    # Patch size of the ViT backbone; affects feature extraction grid.
+    # For sat-493m, `vitl16` usually implies 16, `vitl14` implies 14.
     ps = 14 if "vitl14" in model_cfg["backbone"] else 16
+
+    # Overlap configuration:
+    #   - if < 1, interpret as fraction of tile_size
+    #   - if >=1, interpret as absolute pixel overlap
     overlap_cfg = infer_cfg.get("overlap", 0.0)
     overlap_px = int(tile_size * overlap_cfg) if overlap_cfg < 1 else int(overlap_cfg)
+
+    # Stride between tile origins. Smaller stride → more overlap →
+    # smoother boundaries but higher compute.
     stride = max(1, tile_size - overlap_px)
+
+    # Build test-time augmentation (TTA) transforms (hflip/vflip).
+    # TTA averages predictions over augmented versions to reduce variance.
     tta_transforms = build_tta_transforms(infer_cfg.get("tta", {}))
+
+    # Read image metadata once to allocate full-size accumulators.
     with rasterio.open(input_tif) as src:
         profile = src.profile.copy()
         height, width = src.height, src.width
         channels = src.count
+
+    # For now, the pipeline assumes 3-band imagery.
     assert channels == 3, "Expected 3-band imagery."
+
+    # Pre-allocate probability and count accumulators over full scene:
+    #   - prob_accum[c, y, x] stores summed probabilities for each class.
+    #   - count_accum[y, x]   counts how many tiles have covered each pixel.
     prob_accum = np.zeros((model_cfg["num_classes"], height, width), dtype=np.float32)
     count_accum = np.zeros((height, width), dtype=np.float32)
+
+    # Purely for logging progress.
     total_tiles = math.ceil(height / stride) * math.ceil(width / stride)
     logger.info(f"Running inference on {total_tiles} tiles with stride {stride}.")
+
+    # Main tiling loop wrapped in TimedBlock for profiling.
     with rasterio.open(input_tif) as src, TimedBlock(logger, "Inference phase"):
         tile_counter = 0
         for y in range(0, height, stride):
             for x in range(0, width, stride):
                 tile_counter += 1
+
+                # Compute the tile window in [y, x] space, clamped to image bounds.
                 y_max = min(y + tile_size, height)
                 x_max = min(x + tile_size, width)
                 window = Window.from_slices((y, y_max), (x, x_max))
+
+                # Read current tile (C, H_tile, W_tile) and convert to HWC.
                 img_tile = src.read(window=window, boundless=True)
                 img_tile = np.transpose(img_tile, (1, 2, 0))
+
+                # Skip entirely empty tiles (all zeros) to save compute.
                 if np.max(img_tile) == 0:
                     continue
-                tile_probs = np.zeros((model_cfg["num_classes"], y_max - y, x_max - x), dtype=np.float32)
+
+                # Accumulator for per-tile class probabilities. This will be
+                # averaged over TTA augmentations.
+                tile_probs = np.zeros(
+                    (model_cfg["num_classes"], y_max - y, x_max - x), dtype=np.float32
+                )
+
+                # Loop over TTA transforms (none/hflip/vflip).
                 for transform in tta_transforms:
+                    # Apply augmentation on numpy array (H, W, C).
                     aug_img = transform.apply(img_tile)
+
+                    # Simple normalization: scale uint8 [0, 255] → float32 [0, 1].
                     img_tile_norm = (aug_img.astype(np.float32) / 255.0).astype(np.float32)
+
+                    # Convert to PyTorch tensor (B, C, H, W).
                     img_t = torch.from_numpy(img_tile_norm).permute(2, 0, 1).unsqueeze(0).to(device)
+
+                    # Extract multiscale DINO features for this augmented tile.
                     feats = extract_multiscale_features(
                         aug_img.astype(np.float32),
                         backbone,
@@ -623,26 +891,63 @@ def inference_phase(config: dict, logger: VerbosityLogger) -> None:
                         model_cfg["layers"],
                         ps=ps,
                     )
+                    # Add batch dimension to each feature map and move to device.
                     feats_batched = [f.to(device).unsqueeze(0) for f in feats]
+
+                    # Forward pass through the head under AMP, invert the TTA
+                    # augmentation on logits, and resize logits back to tile size
+                    # if needed.
                     with torch.no_grad(), torch.amp.autocast(device_type=device.type):
                         logits = head(img_t, feats_batched)
                         logits = transform.invert_logits(logits)
+
+                        # Some heads may output logits at slightly different
+                        # spatial resolution; interpolate back to tile size.
                         if logits.shape[-2:] != img_t.shape[-2:]:
-                            logits = F.interpolate(logits, size=img_t.shape[-2:], mode="bilinear", align_corners=False)
+                            logits = F.interpolate(
+                                logits,
+                                size=img_t.shape[-2:],
+                                mode="bilinear",
+                                align_corners=False,
+                            )
+
+                        # Convert logits to probabilities via softmax and to numpy.
                         probs = torch.softmax(logits, dim=1).squeeze(0).cpu().numpy()
+
+                    # Add probabilities (cropped in case tile touches borders).
                     tile_probs += probs[:, : y_max - y, : x_max - x]
+
+                # Average over TTA samples.
                 tile_probs /= len(tta_transforms)
+
+                # Accumulate into global buffers and update coverage counts.
                 prob_accum[:, y:y_max, x:x_max] += tile_probs
                 count_accum[y:y_max, x:x_max] += 1
+
+                # Periodic progress logging so long runs are visible.
                 if tile_counter % 50 == 0 or tile_counter == total_tiles:
                     logger.info(f"Inference progress: {tile_counter}/{total_tiles} tiles.")
+
+    # Avoid division by zero in uncovered pixels (should be rare if tiling is correct).
     count_accum[count_accum == 0] = 1
+
+    # Normalize aggregated probabilities by the number of times each pixel
+    # has been seen (handles overlaps).
     prob_accum /= count_accum
+
+    # Final hard prediction: argmax over class dimension.
     pred_full = prob_accum.argmax(axis=0).astype(np.uint8)
+
+    # Update output profile to single-band uint8 with nodata=0.
     profile.update(dtype=rasterio.uint8, count=1, nodata=0)
+
+    # Ensure output directory exists.
     os.makedirs(os.path.dirname(output_tif) or ".", exist_ok=True)
+
+    # Write prediction raster to disk.
     with rasterio.open(output_tif, "w", **profile) as dst:
         dst.write(pred_full, 1)
+
     logger.info(f"Saved prediction to {output_tif}")
 
 
@@ -650,18 +955,47 @@ def main(config_path: str | None = None) -> None:
     """
     Load a YAML configuration file and execute the enabled phases.
 
-    >>> main("config.example.yml")  # doctest: +SKIP
+    Command-line usage pattern:
+      python script.py path/to/config.yml
+
+    Execution order (each phase can be individually enabled/disabled):
+      1. prepare_phase  → build cached tiles and DINO features
+      2. verify_phase   → sanity-check cached tiles
+      3. train_phase    → train segmentation head on cached tiles
+      4. inference_phase→ run sliding-window inference on large rasters
     """
 
+    # Resolve config path:
+    #   - explicit function arg (config_path), or
+    #   - first CLI argument (sys.argv[1]), or
+    #   - embedded default in `load_config` if none provided.
     candidate = config_path or (sys.argv[1] if len(sys.argv) > 1 else None)
+
+    # Load configuration dict from YAML or similar. The loader also stashes
+    # the resolved config path in `_config_path` for logging.
     config = load_config(candidate)
+
+    # Apply global resource settings (threads, seeds, matmul precision),
+    # so all subsequent phases share the same deterministic environment.
     apply_resource_config(config)
+
+    # Build logger with requested verbosity, timestamps, and optional logfile.
     logger = build_logger(config)
+
     logger.info(f"Loaded configuration from {config.get('_config_path', 'embedded dict')}")
+
+    # Phase 1: data preparation (tiling + DINO feature cache).
     prepare_phase(config, logger)
+
+    # Phase 2: verification of the cached dataset.
     verify_phase(config, logger)
+
+    # Phase 3: training of the segmentation head.
     train_phase(config, logger)
+
+    # Phase 4: sliding-window inference over large rasters.
     inference_phase(config, logger)
+
     logger.info("All enabled phases completed.")
 
 
