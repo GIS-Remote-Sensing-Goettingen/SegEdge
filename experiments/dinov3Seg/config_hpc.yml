@@ -6,12 +6,12 @@ resources:
 logging:
   level: debug
   timestamps: true
-  file: logs/run.log
+  file: /user/davide.mattioli/u20330/SegEdge/experiments/dinov3Seg/logs/run.log
 
 paths:
-  raw_images_dir: /home/mak/PycharmProjects/SegEdge/experiments/get_data_from_api/patches_mt/
-  label_path: /run/media/mak/Partition of 1TB disk/SH_dataset/planet_labels_2022.tif
-  processed_dir: /mnt/OS/processed_tiles_1024/
+  raw_images_dir: /mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/folder_1/
+  label_path: /user/davide.mattioli/u20330/planet_labels_2022.tif
+  processed_dir: /mnt/ceph-hdd/projects/mthesis_davide_mattioli/processed/folder_1
 
 dataset:
   augmentations:
@@ -26,7 +26,7 @@ dataset:
 model:
   backbone: facebook/dinov3-vitl16-pretrain-sat493m
   layers: [5, 11, 17, 23]
-  head: unet
+  head: unet_v2
   num_classes: 2
   dino_channels: 1024
 
@@ -42,8 +42,8 @@ verify:
 train:
   enable: true
   device: cuda
-  processed_dir: /mnt/OS/processed_tiles_1024/
-  weights_dir: weights
+  processed_dir: /mnt/ceph-hdd/projects/mthesis_davide_mattioli/processed/folder_1
+  weights_dir: /user/davide.mattioli/u20330/SegEdge/experiments/dinov3Seg/weights/
   batch_size: 4
   epochs: 30
   muon_lr: 0.02
