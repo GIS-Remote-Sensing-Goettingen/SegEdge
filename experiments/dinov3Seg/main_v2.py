@@ -1,5 +1,8 @@
 import os
 
+from rasterio.enums import Resampling
+from rasterio.warp import reproject
+
 # PREVENT CPU HANGS & MEMORY FRAG
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -496,8 +499,8 @@ def train_model(processed_dir, device):
     optimizer = Muon(muon_params, lr=MUON_LR, momentum=0.95, adamw_params=adamw_params, adamw_lr=ADAMW_LR)
 
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=[MUON_LR, ADAMW_LR], total_steps=len(train_loader) * EPOCHS,
-        pct_start=0.3, div_factor=25.0, final_div_factor=1000.0
+        optimizer, max_lr=MUON_LR, total_steps=len(train_loader) * EPOCHS,
+        pct_start=0.1, div_factor=25.0, final_div_factor=1000.0
     )
 
     criterion = nn.CrossEntropyLoss()
@@ -581,7 +584,7 @@ if __name__ == "__main__":
     MODEL_NAME = "facebook/dinov3-vitl16-pretrain-sat493m"
     LAYERS_TO_EXTRACT = [5, 11, 17, 23]
 
-    prepare_data_tiles(RAW_IMAGES_DIR, LARGE_LABEL_PATH, PROCESSED_DATA_DIR, MODEL_NAME, LAYERS_TO_EXTRACT, DEVICE,
-                       tile_size=512)
-    verify_and_clean_dataset_fast(PROCESSED_DATA_DIR)
+    #prepare_data_tiles(RAW_IMAGES_DIR, LARGE_LABEL_PATH, PROCESSED_DATA_DIR, MODEL_NAME, LAYERS_TO_EXTRACT, DEVICE,
+    #                  tile_size=512)
+    #verify_and_clean_dataset_fast(PROCESSED_DATA_DIR)
     train_model(PROCESSED_DATA_DIR, DEVICE)
