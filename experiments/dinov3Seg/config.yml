@@ -63,8 +63,8 @@ train:
 inference:
   enable: true
   device: cuda
-  input_tif:  /home/mak/PycharmProjects/SegEdge/experiments/get_data_from_api/patches_mt/dop20_596000_5973000_1km_20cm.tif
-  output_tif: /home/mak/PycharmProjects/SegEdge/experiments/dinov3Seg/test/dop20_596000_5973000_1km_20cm_labels.tif
+  input_tif:  /home/mak/PycharmProjects/SegEdge/experiments/get_data_from_api/patches_mt/dop20_592000_5975000_1km_20cm.tif
+  output_tif: /home/mak/PycharmProjects/SegEdge/experiments/dinov3Seg/test/dop20_592000_5975000_1km_20cm_labels.tif
   checkpoint: /home/mak/PycharmProjects/SegEdge/experiments/dinov3Seg/weights/unet_lite_best.pth
   tile_size: 512
   overlap: 0.25

@@ -25,7 +25,7 @@ def available_heads() -> Dict[str, HeadBuilder]:
     Return the set of supported segmentation head builders.
 
     >>> sorted(available_heads().keys())
-    ['maskformer', 'unet', 'unet_v2']
+    ['maskformer', 'unet', 'unet_lite', 'unet_v2']
     """
 
     return {

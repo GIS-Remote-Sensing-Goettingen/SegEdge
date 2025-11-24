@@ -874,10 +874,19 @@ def inference_phase(config: dict, logger: VerbosityLogger) -> None:
                 if np.max(img_tile) == 0:
                     continue
 
-                # Accumulator for per-tile class probabilities. This will be
-                # averaged over TTA augmentations.
+                orig_h, orig_w = img_tile.shape[:2]
+                pad_h = max(0, tile_size - orig_h)
+                pad_w = max(0, tile_size - orig_w)
+                if pad_h or pad_w:
+                    img_tile = np.pad(
+                        img_tile,
+                        ((0, pad_h), (0, pad_w), (0, 0)),
+                        mode="reflect",
+                    )
+
+                # Accumulator for per-tile class probabilities. Averaged over TTA.
                 tile_probs = np.zeros(
-                    (model_cfg["num_classes"], y_max - y, x_max - x), dtype=np.float32
+                    (model_cfg["num_classes"], orig_h, orig_w), dtype=np.float32
                 )
 
                 # Loop over TTA transforms (none/hflip/vflip).
@@ -923,8 +932,9 @@ def inference_phase(config: dict, logger: VerbosityLogger) -> None:
                         # Convert logits to probabilities via softmax and to numpy.
                         probs = torch.softmax(logits, dim=1).squeeze(0).cpu().numpy()
 
-                    # Add probabilities (cropped in case tile touches borders).
-                    tile_probs += probs[:, : y_max - y, : x_max - x]
+                    # Crop to original (unpadded) tile size before accumulating.
+                    probs = probs[:, :orig_h, :orig_w]
+                    tile_probs += probs
 
                 # Average over TTA samples.
                 tile_probs /= len(tta_transforms)
