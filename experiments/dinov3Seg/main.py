@@ -427,7 +427,7 @@ def evaluate(
     metrics = SegmentationMetrics(num_classes)
     autocast = torch.amp.autocast(device_type=device.type) if use_amp else nullcontext()
     with torch.no_grad():
-        for img, features, y in loader:
+        for batch_idx, (img, features, y) in enumerate(loader, 1):
             img = img.to(device)
             y = y.to(device)
             feats = move_features_to_device(features, device)
@@ -443,10 +443,19 @@ def evaluate(
             total += loss.item()
             preds = logits.argmax(dim=1)
             metrics.update(preds.cpu(), target_main.cpu())
+            if logger and batch_idx % 10 == 0:
+                logger.debug(
+                    f"[Val] batch {batch_idx}/{len(loader)} "
+                    f"loss={loss.item():.4f} "
+                    f"running mIoU={metrics.compute()['miou']:.4f}"
+                )
     avg_loss = total / len(loader)
     metric_summary = metrics.compute()
     if logger:
-        logger.debug(f"Validation loss: {avg_loss:.4f} | mIoU: {metric_summary['miou']:.4f}")
+        logger.debug(
+            f"Validation summary :: loss={avg_loss:.4f}, "
+            f"mIoU={metric_summary['miou']:.4f}, mDice={metric_summary['mdice']:.4f}"
+        )
     return avg_loss, metric_summary
 
 
