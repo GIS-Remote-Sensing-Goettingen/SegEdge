@@ -264,15 +264,15 @@ class DinoUNetV2Head(SegmentationHead):
         d_mid2 = self.fapm2(features[2])
         d_deep = self.fapm1(features[3])
         x = self.bottleneck(d_deep)
-        x = self.conv1(torch.cat([self.up1(x), d_mid2], dim=1))
-        x = self.conv2(torch.cat([self.up2(x), d_mid1], dim=1))
-        x = self.conv3(torch.cat([self.up3(x), d_shallow], dim=1))
+        x = self.conv1(self._concat(self.up1(x), d_mid2))
+        x = self.conv2(self._concat(self.up2(x), d_mid1))
+        x = self.conv3(self._concat(self.up3(x), d_shallow))
         ds_out = self.ds_head1(x)
         x = self.up4(x)
         if x.shape[-1] < spm_h4.shape[-1]:
             x = self.up4_extra(x)
-        x = self.conv4(torch.cat([x, spm_h4], dim=1))
-        x = self.conv5(torch.cat([self.up5(x), spm_h2], dim=1))
+        x = self.conv4(self._concat(x, spm_h4))
+        x = self.conv5(self._concat(self.up5(x), spm_h2))
         logits = self.final_conv(self.final_up(x))
         return logits, ds_out
 
@@ -294,3 +294,12 @@ class DinoUNetV2Head(SegmentationHead):
 
         logits, _ = self.forward_with_aux(image, features)
         return logits
+
+    def _concat(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        """
+        Align spatial dimensions between tensors before concatenation.
+        """
+
+        if x.shape[-2:] != skip.shape[-2:]:
+            skip = F.interpolate(skip, size=x.shape[-2:], mode="bilinear", align_corners=False)
+        return torch.cat([x, skip], dim=1)

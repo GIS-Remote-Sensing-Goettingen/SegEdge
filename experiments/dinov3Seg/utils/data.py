@@ -10,7 +10,8 @@ import gc
 import glob
 import math
 import os
-from typing import Iterable, List, Sequence, Tuple
+import random
+from typing import Iterable, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 import numpy as np
 import rasterio
@@ -24,6 +25,9 @@ from torch.utils.data import Dataset
 from tifffile import imread
 from tqdm import tqdm
 from transformers import AutoImageProcessor, AutoModel
+
+if TYPE_CHECKING:
+    from utils.logging import VerbosityLogger
 
 
 def extract_multiscale_features(
@@ -148,7 +152,11 @@ def _check_single_file(file_path: str) -> str | None:
         return file_path
 
 
-def verify_and_clean_dataset_fast(output_dir: str, num_workers: int | None = None) -> None:
+def verify_and_clean_dataset_fast(
+    output_dir: str,
+    num_workers: int | None = None,
+    logger: Optional["VerbosityLogger"] = None,
+) -> None:
     """
     Spawn workers to make sure each cached tile is readable; delete corrupt ones.
 
@@ -157,10 +165,14 @@ def verify_and_clean_dataset_fast(output_dir: str, num_workers: int | None = Non
 
     files = glob.glob(os.path.join(output_dir, "*.pt"))
     if not files:
+        if logger:
+            logger.info("No cached tiles found for verification.")
         return
     if num_workers is None:
         num_workers = os.cpu_count() or 1
     corrupted_files = []
+    if logger:
+        logger.info(f"Verifying {len(files)} cached tiles.")
     with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
         futures = [executor.submit(_check_single_file, f) for f in files]
         for future in tqdm(concurrent.futures.as_completed(futures), total=len(files), desc="Verifying"):
@@ -170,8 +182,11 @@ def verify_and_clean_dataset_fast(output_dir: str, num_workers: int | None = Non
     for f in corrupted_files:
         try:
             os.remove(f)
+            if logger:
+                logger.error(f"Removed corrupted tile {f}")
         except OSError:
-            pass
+            if logger:
+                logger.error(f"Failed to remove corrupted tile {f}")
 
 
 def prepare_data_tiles(
@@ -182,6 +197,7 @@ def prepare_data_tiles(
     layers: Sequence[int],
     device: torch.device,
     tile_size: int = 512,
+    logger: Optional["VerbosityLogger"] = None,
 ) -> None:
     """
     Tile raw GeoTIFFs, align labels, and pre-compute DINO feature tensors.
@@ -201,17 +217,28 @@ def prepare_data_tiles(
     ... )  # doctest: +SKIP
     """
 
-    print("--- PHASE 1: TILING & PRE-COMPUTING ---")
+    def _log_info(message: str) -> None:
+        if logger:
+            logger.info(message)
+        else:
+            print(message)
+
+    def _log_debug(message: str) -> None:
+        if logger:
+            logger.debug(message)
+
+    _log_info("--- PHASE 1: TILING & PRE-COMPUTING ---")
     os.makedirs(output_dir, exist_ok=True)
     existing = glob.glob(os.path.join(output_dir, "*.pt"))
     if existing:
-        print(f"[INFO] Found {len(existing)} existing tiles.")
+        _log_info(f"[INFO] Found {len(existing)} existing tiles.")
     processor = AutoImageProcessor.from_pretrained(model_name)
     model = AutoModel.from_pretrained(model_name).eval().to(device)
     image_paths = glob.glob(os.path.join(img_dir, "*.tif"))
     ps = 14 if "vitl14" in model_name else 16
     for img_path in tqdm(image_paths, desc="Processing Large Images"):
         basename = os.path.splitext(os.path.basename(img_path))[0]
+        _log_info(f"Processing image {basename}")
         torch.cuda.empty_cache()
         gc.collect()
         try:
@@ -231,13 +258,16 @@ def prepare_data_tiles(
                 tile_name = f"{basename}_y{y_min}_x{x_min}.pt"
                 save_path = os.path.join(output_dir, tile_name)
                 if os.path.exists(save_path):
+                    _log_debug(f"Tile already exists: {tile_name}")
                     continue
                 img_crop = full_img[y_min:y_max, x_min:x_max, :]
                 lbl_crop = full_label[y_min:y_max, x_min:x_max]
                 if img_crop.max() == 0:
+                    _log_debug(f"Skipping zero tile {tile_name}")
                     continue
                 if np.isnan(img_crop).any():
                     img_crop = np.nan_to_num(img_crop)
+                    _log_debug(f"NaNs detected and replaced for tile {tile_name}")
                 try:
                     feats = extract_multiscale_features(
                         img_crop,
@@ -269,7 +299,7 @@ def prepare_data_tiles(
     del processor
     torch.cuda.empty_cache()
     gc.collect()
-    print("Phase 1 Complete.")
+    _log_info("Phase 1 Complete.")
 
 
 class PrecomputedDataset(Dataset):
@@ -277,7 +307,12 @@ class PrecomputedDataset(Dataset):
     Lazy dataset that loads cached tiles on demand.
     """
 
-    def __init__(self, processed_dir: str) -> None:
+    def __init__(
+        self,
+        processed_dir: str,
+        augmentation_cfg: Optional[dict] = None,
+        file_subset: Optional[List[str]] = None,
+    ) -> None:
         """
         Index every cached tile path.
 
@@ -290,9 +325,13 @@ class PrecomputedDataset(Dataset):
         1
         """
 
-        self.processed_files = glob.glob(os.path.join(processed_dir, "*.pt"))
+        if file_subset is not None:
+            self.processed_files = file_subset
+        else:
+            self.processed_files = sorted(glob.glob(os.path.join(processed_dir, "*.pt")))
         if not self.processed_files:
             raise ValueError(f"No .pt files found in {processed_dir}.")
+        self.augmentation_cfg = augmentation_cfg or {}
 
     def __len__(self) -> int:
         """
@@ -332,4 +371,34 @@ class PrecomputedDataset(Dataset):
         features = data["features"]
         label_raw = data["label"]
         label_seg = torch.from_numpy(label_raw.astype(np.int64)).long()
+        img, features, label_seg = self._apply_augmentations(img, features, label_seg)
         return img, features, label_seg
+
+    def _apply_augmentations(
+        self,
+        img: torch.Tensor,
+        features: List[torch.Tensor],
+        label: torch.Tensor,
+    ) -> tuple[torch.Tensor, List[torch.Tensor], torch.Tensor]:
+        cfg = self.augmentation_cfg
+        if not cfg or not cfg.get("enable", False):
+            return img, features, label
+        feats = [f.clone() for f in features]
+        # Random rotation (multiples of 90 degrees)
+        if cfg.get("rotate90", False):
+            k = random.randint(0, 3)
+            if k:
+                img = torch.rot90(img, k, dims=(1, 2))
+                label = torch.rot90(label, k, dims=(0, 1))
+                feats = [torch.rot90(f, k, dims=(1, 2)) for f in feats]
+        # Horizontal flip
+        if cfg.get("hflip", False) and random.random() < 0.5:
+            img = torch.flip(img, dims=(2,))
+            label = torch.flip(label, dims=(1,))
+            feats = [torch.flip(f, dims=(2,)) for f in feats]
+        # Vertical flip
+        if cfg.get("vflip", False) and random.random() < 0.5:
+            img = torch.flip(img, dims=(1,))
+            label = torch.flip(label, dims=(0,))
+            feats = [torch.flip(f, dims=(1,)) for f in feats]
+        return img, feats, label

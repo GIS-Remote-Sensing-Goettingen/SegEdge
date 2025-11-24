@@ -1,0 +1,73 @@
+resources:
+  seed: 1337
+  omp_threads: 4
+  matmul_precision: high
+
+logging:
+  level: debug
+  timestamps: true
+  file: logs/run.log
+
+paths:
+  raw_images_dir: /home/mak/PycharmProjects/SegEdge/experiments/get_data_from_api/patches_mt/
+  label_path: /run/media/mak/Partition of 1TB disk/SH_dataset/planet_labels_2022.tif
+  processed_dir: /mnt/OS/processed_tiles_1024/
+
+dataset:
+  augmentations:
+    enable: true
+    hflip: true
+    vflip: true
+    rotate90: true
+  splits:
+    train_list:
+    val_list:
+
+model:
+  backbone: facebook/dinov3-vitl16-pretrain-sat493m
+  layers: [5, 11, 17, 23]
+  head: unet
+  num_classes: 2
+  dino_channels: 1024
+
+prepare:
+  enable: false
+  tile_size: 512
+  device: cuda
+
+verify:
+  enable: false
+  workers: 8
+
+train:
+  enable: true
+  device: cuda
+  processed_dir: /mnt/OS/processed_tiles_1024/
+  weights_dir: weights
+  batch_size: 4
+  epochs: 30
+  muon_lr: 0.02
+  adamw_lr: 0.001
+  momentum: 0.95
+  patience: 10
+  val_fraction: 0.2
+  num_workers: 4
+  grad_accum_steps: 1
+  compile: false
+  ema_decay: 0.0
+  loss:
+    ce_weight: 1.0
+    dice_weight: 1.0
+    aux_weight: 0.4
+
+inference:
+  enable: false
+  device: cuda
+  input_tif: /path/to/scene.tif
+  output_tif: test/output_prediction.tif
+  checkpoint: weights/unet_best.pth
+  tile_size: 512
+  overlap: 0.25
+  tta:
+    horizontal_flip: true
+    vertical_flip: false

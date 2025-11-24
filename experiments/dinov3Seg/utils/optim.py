@@ -155,53 +155,66 @@ class Muon(optim.Optimizer):
 
 class EarlyStopping:
     """
-    Track validation loss improvements and stop once patience runs out.
+    Track validation metric improvements and stop once patience runs out.
     """
 
-    def __init__(self, patience: int = 5, min_delta: float = 0.001, path: str = "checkpoint.pth") -> None:
+    def __init__(
+        self,
+        patience: int = 5,
+        min_delta: float = 0.001,
+        path: str = "checkpoint.pth",
+        mode: str = "min",
+    ) -> None:
         """
         Initialize the tracker.
 
         >>> es = EarlyStopping(patience=2, min_delta=0.1, path="tmp.pth")
-        >>> es.best_loss is None
+        >>> es.best_score is None
         True
         """
 
+        if mode not in {"min", "max"}:
+            raise ValueError("mode must be 'min' or 'max'")
         self.patience = patience
         self.min_delta = min_delta
         self.path = path
         self.counter = 0
-        self.best_loss = None
+        self.best_score = None
         self.early_stop = False
+        self.mode = mode
 
-    def __call__(self, val_loss: float, model: torch.nn.Module) -> None:
+    def _is_improvement(self, value: float) -> bool:
+        if self.best_score is None:
+            return True
+        if self.mode == "min":
+            return value < self.best_score - self.min_delta
+        return value > self.best_score + self.min_delta
+
+    def __call__(self, metric: float, model: torch.nn.Module) -> None:
         """
-        Update state with the latest validation loss.
+        Update state with the latest validation metric.
 
-        >>> es = EarlyStopping(patience=1, min_delta=0.0, path="tmp.pth")
+        >>> es = EarlyStopping(patience=1, min_delta=0.0, path="tmp.pth", mode="max")
         >>> class Dummy(torch.nn.Module):
         ...     def state_dict(self):
         ...         return {}
         >>> model = Dummy()
-        >>> es(1.0, model)
-        >>> es(1.1, model)
+        >>> es(0.5, model)
+        >>> es(0.4, model)
         >>> es.early_stop
         True
         """
 
-        if self.best_loss is None:
-            self.best_loss = val_loss
-            self.save_checkpoint(val_loss, model)
-        elif val_loss > self.best_loss - self.min_delta:
+        if self._is_improvement(metric):
+            self.best_score = metric
+            self.save_checkpoint(metric, model)
+            self.counter = 0
+        else:
             self.counter += 1
             if self.counter >= self.patience:
                 self.early_stop = True
-        else:
-            self.best_loss = val_loss
-            self.save_checkpoint(val_loss, model)
-            self.counter = 0
 
-    def save_checkpoint(self, val_loss: float, model: torch.nn.Module) -> None:
+    def save_checkpoint(self, metric: float, model: torch.nn.Module) -> None:
         """
         Persist the model weights to disk.
 

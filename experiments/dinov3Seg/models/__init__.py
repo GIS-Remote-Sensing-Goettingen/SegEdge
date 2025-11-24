@@ -15,7 +15,7 @@ from .base import SegmentationHead
 from .maskformer import DinoMaskFormerHead
 from .unet import DinoUNetHead
 from .unet_v2 import DinoUNetV2Head
-
+from .UnetLite import DinoUNetLiteHead
 
 HeadBuilder = Callable[[int, int], SegmentationHead]
 
@@ -32,6 +32,7 @@ def available_heads() -> Dict[str, HeadBuilder]:
         "unet": DinoUNetHead,
         "unet_v2": DinoUNetV2Head,
         "maskformer": DinoMaskFormerHead,
+        "unet_lite": DinoUNetLiteHead,
     }
 
 
