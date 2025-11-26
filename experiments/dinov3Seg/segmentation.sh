@@ -14,7 +14,7 @@ source activate "${SEGEDGE_CONDA_ENV:-/mnt/vast-standard/home/davide.mattioli/u2
 
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
 
-
+export HF_HUB_OFFLINE=1
 
 # Show GPU and env info (useful for debugging)
 nvidia-smi || true
