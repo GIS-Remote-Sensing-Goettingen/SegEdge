@@ -47,7 +47,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 DEFAULT_RAW_IMAGES_DIR = "/home/mak/PycharmProjects/SegEdge/experiments/get_data_from_api/patches_mt/"
 DEFAULT_LABEL_PATH = "/run/media/mak/Partition of 1TB disk/SH_dataset/planet_labels_2022.tif"
-DEFAULT_PROCESSED_DIR = "/mnt/OS/processed_tiles_1024/"
+DEFAULT_PROCESSED_DIR = "/mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/folder_1/"
 DEFAULT_MODEL_NAME = "facebook/dinov3-vitl16-pretrain-sat493m"
 DEFAULT_LAYERS = [5, 11, 17, 23]
 DEFAULT_HEAD = "unet"
