@@ -12,13 +12,16 @@ import random
 import copy
 from contextlib import nullcontext
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import OneCycleLR
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 import rasterio
 from rasterio.windows import Window
@@ -56,6 +59,46 @@ DEFAULT_DINO_CHANNELS = 1024
 DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
+class DistContext:
+    def __init__(self, enabled=False, rank=0, world_size=1, local_rank=0):
+        self.enabled = enabled
+        self.rank = rank
+        self.world_size = world_size
+        self.local_rank = local_rank
+
+    @property
+    def is_main(self) -> bool:
+        return not self.enabled or self.rank == 0
+
+
+def setup_distributed(resources_cfg: dict) -> DistContext:
+    dist_flag = resources_cfg.get("distributed", False)
+    ctx = DistContext()
+    if not dist_flag:
+        return ctx
+    if not dist.is_available():
+        raise RuntimeError("distributed training requested but torch.distributed unavailable")
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    else:
+        raise RuntimeError("Distributed mode requires torchrun/launch to set RANK and WORLD_SIZE")
+    backend = resources_cfg.get("dist_backend", "nccl")
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+    ctx.enabled = True
+    ctx.rank = rank
+    ctx.world_size = world_size
+    ctx.local_rank = local_rank
+    return ctx
+
+
+def cleanup_distributed(ctx: DistContext) -> None:
+    if ctx.enabled and dist.is_initialized():
+        dist.destroy_process_group()
+
+
 def apply_resource_config(config: dict) -> None:
     """
     Apply thread, seed, and precision settings from the config.
@@ -78,7 +121,7 @@ def apply_resource_config(config: dict) -> None:
     torch.backends.cudnn.benchmark = res_cfg.get("cudnn_benchmark", True)
 
 
-def build_logger(config: dict) -> VerbosityLogger:
+def build_logger(config: dict, enabled: bool = True) -> VerbosityLogger:
     """
     Create a VerbosityLogger using the configuration's logging section.
 
@@ -91,7 +134,7 @@ def build_logger(config: dict) -> VerbosityLogger:
     level = logging_cfg.get("level", "info")
     timestamps = logging_cfg.get("timestamps", True)
     log_file = logging_cfg.get("file")
-    return VerbosityLogger(level=level, timestamps=timestamps, log_file=log_file)
+    return VerbosityLogger(level=level, timestamps=timestamps, log_file=log_file, enabled=enabled)
 
 
 def section_enabled(config: dict, name: str) -> bool:
@@ -242,6 +285,8 @@ def prepare_phase(config: dict, logger: VerbosityLogger) -> None:
     # Device for feature extraction. Typically `cuda` for speed, but can be
     # configured to `cpu` for systems without GPU.
     device = torch.device(section.get("device", DEFAULT_DEVICE))
+    if dist_ctx.enabled:
+        device = torch.device(f"cuda:{dist_ctx.local_rank}")
 
     # TimedBlock is a small profiling/logging helper so we can see how long
     # the preparation phase takes (useful on large datasets).
@@ -309,7 +354,8 @@ def create_dataloaders(
     train_cfg: dict,
     batch_size: int,
     logger: VerbosityLogger,
-) -> tuple[DataLoader, DataLoader]:
+    dist_ctx: DistContext,
+) -> tuple[DataLoader, Optional[DistributedSampler], Optional[DataLoader]]:
     augment_cfg = dataset_cfg.get("augmentations", {})
     split_cfg = dataset_cfg.get("splits", {})
     val_fraction = train_cfg.get("val_fraction", 0.2)
@@ -319,30 +365,42 @@ def create_dataloaders(
         augmentation_cfg=augment_cfg,
         file_subset=train_files,
     )
-    val_dataset = PrecomputedDataset(
-        processed_dir,
-        augmentation_cfg={"enable": False},
-        file_subset=val_files,
-    )
+    train_sampler = None
+    if dist_ctx.enabled:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=dist_ctx.world_size,
+            rank=dist_ctx.rank,
+            shuffle=True,
+            drop_last=False,
+        )
     num_workers = train_cfg.get("num_workers", 4)
-    val_workers = train_cfg.get("val_workers", max(1, num_workers // 2))
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=num_workers > 0,
     )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=val_workers,
-        pin_memory=True,
-        persistent_workers=val_workers > 0,
-    )
-    return train_loader, val_loader
+    val_loader = None
+    if (not dist_ctx.enabled) or dist_ctx.is_main:
+        val_dataset = PrecomputedDataset(
+            processed_dir,
+            augmentation_cfg={"enable": False},
+            file_subset=val_files,
+        )
+        val_workers = train_cfg.get("val_workers", max(1, num_workers // 2))
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=val_workers,
+            pin_memory=True,
+            persistent_workers=val_workers > 0,
+        )
+    return train_loader, train_sampler, val_loader
 
 
 def move_features_to_device(features: List[torch.Tensor], device: torch.device) -> List[torch.Tensor]:
@@ -398,7 +456,7 @@ def split_params_for_muon(model: torch.nn.Module) -> Tuple[List[torch.nn.Paramet
 
 def evaluate(
     model: torch.nn.Module,
-    loader: DataLoader,
+    loader: Optional[DataLoader],
     loss_fn: SegmentationLoss,
     device: torch.device,
     use_amp: bool,
@@ -422,6 +480,9 @@ def evaluate(
     True
     """
 
+    if loader is None:
+        zeros = torch.zeros(num_classes)
+        return 0.0, {"per_class_iou": zeros, "per_class_dice": zeros, "miou": 0.0, "mdice": 0.0}
     model.eval()
     total = 0.0
     metrics = SegmentationMetrics(num_classes)
@@ -536,12 +597,12 @@ def train_phase(config: dict, logger: VerbosityLogger) -> None:
 
     # Build DataLoaders over cached tiles (train/val). These load precomputed
     # tensors from disk instead of decoding GeoTIFFs at runtime.
-    train_loader, val_loader = create_dataloaders(
-        processed_dir, dataset_cfg, section, batch_size, logger
+    train_loader, train_sampler, val_loader = create_dataloaders(
+        processed_dir, dataset_cfg, section, batch_size, logger, dist_ctx
     )
-    logger.info(
-        f"Dataset split: {len(train_loader.dataset)} train / {len(val_loader.dataset)} val tiles."
-    )
+    logger.info(f"Dataset split: {len(train_loader.dataset)} train tiles.")
+    if val_loader is not None:
+        logger.info(f"Validation tiles: {len(val_loader.dataset)}")
 
     # Instantiate the segmentation head (UNet, DinoUNet, etc.) according to
     # config. The backbone is not created here because features are cached.
@@ -556,15 +617,23 @@ def train_phase(config: dict, logger: VerbosityLogger) -> None:
     if section.get("compile", False) and hasattr(torch, "compile"):
         model = torch.compile(model)
 
-    # Log number of trainable parameters; useful sanity check and for
-    # comparing different heads (full vs lite, etc.).
-    total_params = sum(p.numel() for p in model.parameters())
+    if dist_ctx.enabled:
+        model = DDP(
+            model,
+            device_ids=[dist_ctx.local_rank],
+            output_device=dist_ctx.local_rank,
+            find_unused_parameters=False,
+        )
+
+    # Log number of trainable parameters.
+    total_params = sum(p.numel() for p in (model.module if dist_ctx.enabled else model).parameters())
     logger.info(f"Initialized head '{model_cfg['head']}' with {total_params:,} parameters.")
 
     # Split parameters by dimensionality:
     #   - >=2D tensors (matrices/conv kernels) go to Muon optimizer
     #   - 1D tensors (biases, LayerNorm weights) go to AdamW
-    muon_params, adamw_params = split_params_for_muon(model)
+    base_model = model.module if dist_ctx.enabled else model
+    muon_params, adamw_params = split_params_for_muon(base_model)
 
     # Construct the hybrid Muon + AdamW optimizer. Muon handles "matrix-like"
     # parameters, AdamW handles 1D params. LR for each group can be tuned
@@ -624,7 +693,7 @@ def train_phase(config: dict, logger: VerbosityLogger) -> None:
     # Optional EMA: maintain a smoothed copy of the model parameters, which
     # often yields more stable validation performance.
     ema_decay = section.get("ema_decay", 0.0)
-    ema = ModelEMA(model, ema_decay) if ema_decay > 0 else None
+    ema = ModelEMA(base_model, ema_decay) if ema_decay > 0 else None
 
     # Core training hyperparameters from config.
     epochs = section.get("epochs", 30)
@@ -700,7 +769,7 @@ def train_phase(config: dict, logger: VerbosityLogger) -> None:
 
                         # Update EMA weights if enabled.
                         if ema:
-                            ema.update(model)
+                            ema.update(model.module if dist_ctx.enabled else model)
 
                         global_step += 1
 
@@ -720,7 +789,7 @@ def train_phase(config: dict, logger: VerbosityLogger) -> None:
 
                 # Use EMA model for evaluation if present; otherwise use
                 # the raw model. This usually yields smoother validation metrics.
-                eval_model = ema.ema_model if ema else model
+                eval_model = ema.ema_model if ema else (model.module if dist_ctx.enabled else model)
 
                 # Run full validation pass on cached tiles.
                 val_loss, val_metrics = evaluate(
@@ -729,9 +798,15 @@ def train_phase(config: dict, logger: VerbosityLogger) -> None:
                     loss_fn,
                     device,
                     use_amp,
-                    logger,
+                    logger if dist_ctx.is_main else None,
                     model_cfg["num_classes"],
                 )
+
+                if dist_ctx.enabled:
+                    loss_tensor = torch.tensor([val_loss, val_metrics["miou"]], device=device)
+                    dist.broadcast(loss_tensor, src=0)
+                    val_loss = loss_tensor[0].item()
+                    val_metrics["miou"] = loss_tensor[1].item()
 
                 logger.info(
                     f"Epoch {epoch + 1} | Train Loss: {avg_train_loss:.4f} | "
@@ -744,18 +819,26 @@ def train_phase(config: dict, logger: VerbosityLogger) -> None:
                     weights_dir,
                     f"{model_cfg['head']}_VALLOSS_{val_loss:.4f}_MIOU_{val_metrics['miou']:.4f}_EPOCH_{epoch + 1}.pth",
                 )
-                torch.save(eval_model.state_dict(), epoch_ckpt)
+                if dist_ctx.is_main:
+                    torch.save(eval_model.state_dict(), epoch_ckpt)
 
                 # Update early stopping using the monitored metric (mIoU).
                 # It will also keep track of and write the best model to `best_path`.
-                early_stopping(val_metrics["miou"], eval_model)
-
-                # Exit training loop early if no improvement for `patience` epochs.
-                if early_stopping.early_stop:
-                    logger.info("Early stopping triggered.")
+                stop_flag = False
+                if dist_ctx.is_main:
+                    early_stopping(val_metrics["miou"], eval_model)
+                    stop_flag = early_stopping.early_stop
+                if dist_ctx.enabled:
+                    flag_tensor = torch.tensor(1 if stop_flag else 0, device=device)
+                    dist.broadcast(flag_tensor, src=0)
+                    stop_flag = bool(flag_tensor.item())
+                if stop_flag:
+                    if dist_ctx.is_main:
+                        logger.info("Early stopping triggered.")
                     break
 
-    logger.info(f"Training finished. Best weights saved to {best_path}")
+    if dist_ctx.is_main:
+        logger.info(f"Training finished. Best weights saved to {best_path}")
 
 
 def inference_phase(config: dict, logger: VerbosityLogger) -> None:
@@ -994,12 +1077,12 @@ def main(config_path: str | None = None) -> None:
     # the resolved config path in `_config_path` for logging.
     config = load_config(candidate)
 
-    # Apply global resource settings (threads, seeds, matmul precision),
-    # so all subsequent phases share the same deterministic environment.
+    # Apply resource settings (threads, seeds, matmul precision).
     apply_resource_config(config)
+    dist_ctx = setup_distributed(config.get("resources", {}))
 
     # Build logger with requested verbosity, timestamps, and optional logfile.
-    logger = build_logger(config)
+    logger = build_logger(config, enabled=dist_ctx.is_main)
 
     logger.info(f"Loaded configuration from {config.get('_config_path', 'embedded dict')}")
 
@@ -1010,12 +1093,14 @@ def main(config_path: str | None = None) -> None:
     verify_phase(config, logger)
 
     # Phase 3: training of the segmentation head.
-    train_phase(config, logger)
+    train_phase(config, logger, dist_ctx)
 
     # Phase 4: sliding-window inference over large rasters.
-    inference_phase(config, logger)
+    if dist_ctx.is_main:
+        inference_phase(config, logger)
 
     logger.info("All enabled phases completed.")
+    cleanup_distributed(dist_ctx)
 
 
 if __name__ == "__main__":

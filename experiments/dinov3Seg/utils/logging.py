@@ -29,6 +29,7 @@ class VerbosityLogger:
     level: str = "info"
     timestamps: bool = True
     log_file: Optional[str] = None
+    enabled: bool = True
 
     def __post_init__(self) -> None:
         """
@@ -65,6 +66,8 @@ class VerbosityLogger:
         [DEBUG] detailed
         """
 
+        if not self.enabled:
+            return
         level = level.lower()
         if level not in LEVEL_MAP:
             return
