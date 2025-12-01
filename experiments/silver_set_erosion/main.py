@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: GPL-2.0
 #
 # Single-scale zero-shot transfer from Image A -> Image B using DINOv3.
-# Only the pieces required for run_zero_shot_transfer(...) are kept.
+# - GPU kNN (torch matmul + top-k)
+# - Use SH_2022 labels to clip predictions on B (+5m buffer)
+# - Validate vs ground truth shapefile labels_final.shp
+# - Grid search over k and threshold to pick best parameters.
 
 import time
 import os
@@ -12,16 +15,22 @@ import matplotlib.pyplot as plt
 
 from PIL import Image
 from skimage.transform import resize
-from skimage.morphology import erosion, disk
+from skimage.morphology import erosion, disk, dilation
 
 import rasterio
 from rasterio.plot import reshape_as_image
 from rasterio.warp import reproject, Resampling
 import rasterio.features as rfeatures
+from rasterio.crs import CRS
 
 import fiona
+from shapely.geometry import shape, mapping
+from shapely.ops import transform as shp_transform
+from pyproj import Transformer
 
 from transformers import AutoImageProcessor, AutoModel
+from pydensecrf import densecrf as dcrf
+from pydensecrf.utils import unary_from_softmax
 
 
 # ----------------------------------------------------------------------
@@ -32,23 +41,12 @@ DEBUG_TIMING = True
 
 
 def time_start():
-    """
-    Start a timing block.
-
-    Returns a timestamp or None if DEBUG_TIMING is disabled.
-    """
     if not DEBUG_TIMING:
         return None
     return time.perf_counter()
 
 
 def time_end(label: str, t0):
-    """
-    End a timing block and print a standardized timing line.
-
-    label: short name for the code section.
-    t0: value returned by time_start().
-    """
     if not DEBUG_TIMING or t0 is None:
         return
     dt = time.perf_counter() - t0
@@ -61,10 +59,6 @@ def time_end(label: str, t0):
 
 
 def init_model(model_name: str):
-    """
-    Load DINOv3 model + image processor, move model to CUDA if available.
-    Kept small and explicit for reproducibility.
-    """
     t0 = time_start()
 
     processor = AutoImageProcessor.from_pretrained(model_name)
@@ -85,24 +79,15 @@ def init_model(model_name: str):
 
 
 def load_dop20_image(path: str) -> np.ndarray:
-    """
-    Load a DOP20 GeoTIFF into an HxWxC uint8-like array.
-    Rasterio returns (bands, H, W); we convert to (H, W, C).
-    """
     with rasterio.open(path) as src:
         arr = src.read()  # (bands, H, W)
     img = reshape_as_image(arr)  # (H, W, C)
     if img.shape[2] > 3:
-        # Many DOP tiles are RGBA; DINOv3 expects 3 channels.
         img = img[:, :, :3]
     return img
 
 
 def reproject_labels_to_image(ref_img_path: str, labels_path: str) -> np.ndarray:
-    """
-    Reproject label raster onto the grid of the reference image.
-    Returns a single-band label array (H, W).
-    """
     with rasterio.open(ref_img_path) as ref, rasterio.open(labels_path) as src:
         dst_meta = ref.meta.copy()
         dst_meta.update(dtype=src.dtypes[0], count=src.count)
@@ -127,16 +112,72 @@ def reproject_labels_to_image(ref_img_path: str, labels_path: str) -> np.ndarray
     return labels_2d
 
 
+def rasterize_vector_labels(vector_path: str,
+                            ref_raster_path: str,
+                            burn_value: int = 1) -> np.ndarray:
+    """
+    Rasterize a vector shapefile onto the grid of ref_raster_path.
+
+    - If vector CRS is missing, we assume EPSG:4326 (lat/lon).
+    - If CRS differ, geometries are reprojected to raster CRS.
+
+    Returns:
+        gt_mask: uint8, shape (H, W), values in {0, burn_value}.
+    """
+    t0 = time_start()
+
+    with rasterio.open(ref_raster_path) as src:
+        out_shape = (src.height, src.width)
+        transform = src.transform
+        raster_crs = src.crs
+
+    with fiona.open(vector_path, "r") as shp:
+        vec_crs = shp.crs
+
+        # If CRS is missing/unknown, assume WGS84 lat/lon.
+        if not vec_crs:
+            print("[warn] vector CRS is missing/unknown; assuming EPSG:4326 (WGS84)")
+            vec_crs = CRS.from_epsg(4326).to_dict()
+
+        # Setup transformer if needed
+        transformer = None
+        if raster_crs and vec_crs and vec_crs != raster_crs.to_dict():
+            print(f"[info] reprojecting vector geometries "
+                  f"from {vec_crs} -> {raster_crs.to_dict()}")
+            transformer = Transformer.from_crs(
+                vec_crs,
+                raster_crs.to_dict(),
+                always_xy=True,
+            )
+
+        shapes = []
+        for feat in shp:
+            geom = feat["geometry"]
+            if transformer is not None:
+                geom_obj = shape(geom)
+                geom_obj = shp_transform(transformer.transform, geom_obj)
+                geom = mapping(geom_obj)
+            shapes.append((geom, burn_value))
+
+    gt_mask = rfeatures.rasterize(
+        shapes=shapes,
+        out_shape=out_shape,
+        transform=transform,
+        fill=0,
+        all_touched=True,
+        dtype="uint8",
+    )
+
+    time_end("rasterize_vector_labels", t0)
+    return gt_mask
+
+
 # ----------------------------------------------------------------------
 # 3. helpers (normalization, tiling, label-to-patch, feature I/O)
 # ----------------------------------------------------------------------
 
 
 def l2_normalize(feats: np.ndarray, eps: float = 1e-8) -> np.ndarray:
-    """
-    L2-normalize features along the last dimension.
-    This mirrors the typical DINOv3 usage before cosine kNN.
-    """
     norms = np.linalg.norm(feats, axis=-1, keepdims=True) + eps
     return feats / norms
 
@@ -145,10 +186,6 @@ def tile_iterator(image_hw3: np.ndarray,
                   labels_hw: np.ndarray | None = None,
                   tile_size: int = 1024,
                   stride: int | None = None):
-    """
-    Sliding-window tiling over a large HxWxC image (and labels).
-    This pattern is standard for ViT on large remote-sensing tiles.
-    """
     h, w = image_hw3.shape[:2]
     if stride is None:
         stride = tile_size
@@ -174,10 +211,6 @@ def tile_iterator(image_hw3: np.ndarray,
 def crop_to_multiple_of_ps(img_tile_hw3: np.ndarray,
                            labels_tile_hw: np.ndarray | None,
                            ps: int):
-    """
-    Crop tile borders so that H and W are multiples of patch size.
-    This makes the ViT patch grid well-defined and avoids silent cropping.
-    """
     h, w = img_tile_hw3.shape[:2]
     h_eff = (h // ps) * ps
     w_eff = (w // ps) * ps
@@ -195,10 +228,6 @@ def labels_to_patch_masks(labels_tile: np.ndarray,
                           hp: int,
                           wp: int,
                           pos_frac_thresh: float = 0.1):
-    """
-    Convert pixel-level labels to patch-level masks by pooling.
-    This preserves thin linear structures better than a naive resize.
-    """
     h_eff, w_eff = labels_tile.shape
     patch_h = h_eff // hp
     patch_w = w_eff // wp
@@ -219,9 +248,6 @@ def tile_feature_path(feature_dir: str,
                       image_id: str,
                       y: int,
                       x: int) -> str:
-    """
-    Build a unique file path for a tile's DINO features.
-    """
     fname = f"{image_id}_y{y}_x{x}_features.npy"
     return os.path.join(feature_dir, fname)
 
@@ -231,11 +257,6 @@ def save_tile_features(feats_tile: np.ndarray,
                        image_id: str,
                        y: int,
                        x: int):
-    """
-    Save per-tile DINO features to disk.
-
-    feats_tile: (Hp, Wp, C) array for this tile.
-    """
     os.makedirs(feature_dir, exist_ok=True)
     fpath = tile_feature_path(feature_dir, image_id, y, x)
     np.save(fpath, feats_tile.astype(np.float32))
@@ -244,15 +265,6 @@ def save_tile_features(feats_tile: np.ndarray,
 def consolidate_features_for_image(feature_dir: str,
                                    image_id: str,
                                    output_suffix: str = "_features_full.npy"):
-    """
-    Look for all tile feature files for a given image_id in feature_dir,
-    concatenate them into a single (N, C) array, and save as one .npy.
-
-    Tile files are expected to be named:
-        {image_id}_y{y}_x{x}_features.npy
-
-    Returns the output path if any tiles were found, else None.
-    """
     t0 = time_start()
 
     if not os.path.isdir(feature_dir):
@@ -303,11 +315,6 @@ def extract_patch_features_single_scale(image_hw3: np.ndarray,
                                         device,
                                         ps: int = 16,
                                         aggregate_layers=None):
-    """
-    Single-scale DINOv3 inference.
-    We disable internal resize/crop in the processor and rely on external
-    cropping to multiples of ps.
-    """
     inputs = processor(
         images=image_hw3,
         return_tensors="pt",
@@ -362,13 +369,6 @@ def build_banks_single_scale(img_a: np.ndarray,
                              aggregate_layers=None,
                              feature_dir: str | None = None,
                              image_id: str | None = None):
-    """
-    Build positive and negative banks from Image A in a single scale.
-    Operates over tiles and converts labels to patch-level masks.
-
-    If feature_dir and image_id are given, per-tile DINO features are
-    cached on disk and reused on subsequent runs.
-    """
     t0 = time_start()
 
     pos_list = []
@@ -392,7 +392,6 @@ def build_banks_single_scale(img_a: np.ndarray,
         feats_tile = None
         hp = wp = None
 
-        # Try cache first if configured.
         if feature_dir is not None and image_id is not None:
             fpath = tile_feature_path(feature_dir, image_id, y, x)
             if os.path.exists(fpath):
@@ -461,7 +460,7 @@ def build_banks_single_scale(img_a: np.ndarray,
 
 
 # ----------------------------------------------------------------------
-# 6. single-scale zero-shot scoring on Image B (GPU kNN + caching)
+# 6. GPU kNN scoring on Image B (single-scale, cached features)
 # ----------------------------------------------------------------------
 
 
@@ -479,20 +478,6 @@ def zero_shot_knn_single_scale_B_with_saliency(
     feature_dir: str | None = None,
     image_id: str | None = None,
 ):
-    """
-    Single-scale zero-shot kNN scoring and saliency map on Image B.
-
-    GPU version:
-    - Move pos_bank to device once.
-    - For each tile, move its patch features to device.
-    - Compute cosine similarities via batched matmul and top-k.
-
-    Score: mean cosine similarity of each patch to its k nearest
-    positive-bank neighbours.
-
-    Saliency: simple kNN-weighted similarity (higher => contributes
-    more strongly to being classified as 'like positives').
-    """
     t0 = time_start()
 
     h_full, w_full = img_b.shape[:2]
@@ -504,7 +489,6 @@ def zero_shot_knn_single_scale_B_with_saliency(
     cached_tiles = 0
     computed_tiles = 0
 
-    # Move pos_bank once to GPU (or CPU device if no CUDA).
     pos_bank_t = torch.from_numpy(pos_bank.astype(np.float32)).to(device)
     k_eff = min(k, pos_bank_t.shape[0])
 
@@ -518,7 +502,6 @@ def zero_shot_knn_single_scale_B_with_saliency(
         feats_tile = None
         hp = wp = None
 
-        # Try cache first if configured.
         if feature_dir is not None and image_id is not None:
             fpath = tile_feature_path(feature_dir, image_id, y, x)
             if os.path.exists(fpath):
@@ -546,20 +529,16 @@ def zero_shot_knn_single_scale_B_with_saliency(
                     x=x,
                 )
 
-        # Flatten tile patches: (Hp, Wp, C) -> (Nb, C)
         x_feats = feats_tile.reshape(-1, feats_tile.shape[-1]).astype(np.float32)
 
-        # GPU kNN via cosine similarity (dot product on L2-normalized features).
         with torch.no_grad():
-            x_feats_t = torch.from_numpy(x_feats).to(device)  # (Nb, C)
-            sims_full = x_feats_t @ pos_bank_t.t()            # (Nb, Npos)
+            x_feats_t = torch.from_numpy(x_feats).to(device)      # (Nb, C)
+            sims_full = x_feats_t @ pos_bank_t.t()                # (Nb, Npos)
             sims_topk, _ = torch.topk(sims_full, k=k_eff, dim=1)
-            sims = sims_topk.cpu().numpy()                    # (Nb, k_eff)
+            sims = sims_topk.cpu().numpy()                        # (Nb, k_eff)
 
-        # score: mean similarity over k neighbours
         score_patch = sims.mean(axis=1).reshape(hp, wp)
 
-        # saliency: weighted self-contribution
         weights = sims / (sims.sum(axis=1, keepdims=True) + 1e-8)
         saliency_vals = (weights * sims).sum(axis=1)
         saliency_patch = saliency_vals.reshape(hp, wp)
@@ -588,7 +567,7 @@ def zero_shot_knn_single_scale_B_with_saliency(
     score_full[mask_nonzero] /= weight_full[mask_nonzero]
     saliency_full[mask_nonzero] /= weight_full[mask_nonzero]
 
-    time_end("zero_shot_knn_single_scale_B_with_saliency (GPU)", t0)
+    time_end(f"zero_shot_knn_single_scale_B_with_saliency (GPU, k={k})", t0)
     print(
         f"[cache] B: cached tiles={cached_tiles}, "
         f"computed tiles={computed_tiles}"
@@ -598,118 +577,212 @@ def zero_shot_knn_single_scale_B_with_saliency(
 
 
 # ----------------------------------------------------------------------
-# 7. top-level runner
+# 7. SH_2022 clipping + metrics
 # ----------------------------------------------------------------------
 
 
-def run_zero_shot_transfer(
-    img_a: np.ndarray,
-    labels_a: np.ndarray,
+def build_sh_buffer_mask(labels_sh: np.ndarray,
+                         buffer_pixels: int) -> np.ndarray:
+    base = labels_sh > 0
+    if buffer_pixels <= 0:
+        return base
+    buf = dilation(base.astype(bool), disk(buffer_pixels))
+    return buf
+
+
+def compute_metrics(pred_mask: np.ndarray, gt_mask: np.ndarray) -> dict:
+    pred = pred_mask.astype(bool)
+    gt = gt_mask.astype(bool)
+
+    tp = np.logical_and(pred, gt).sum()
+    fp = np.logical_and(pred, ~gt).sum()
+    fn = np.logical_and(~pred, gt).sum()
+    tn = np.logical_and(~pred, ~gt).sum()
+
+    eps = 1e-8
+    precision = tp / (tp + fp + eps)
+    recall = tp / (tp + fn + eps)
+    iou = tp / (tp + fp + fn + eps)
+    f1 = 2.0 * precision * recall / (precision + recall + eps)
+
+    return {
+        "tp": int(tp),
+        "fp": int(fp),
+        "fn": int(fn),
+        "tn": int(tn),
+        "precision": float(precision),
+        "recall": float(recall),
+        "iou": float(iou),
+        "f1": float(f1),
+    }
+def refine_with_densecrf(
+    img_rgb: np.ndarray,
+    score_map: np.ndarray,
+    sh_mask: np.ndarray | None = None,
+    n_iters: int = 5,
+    pos_w: float = 3.0,
+    pos_xy_std: float = 3.0,
+    bilateral_w: float = 5.0,
+    bilateral_xy_std: float = 50.0,
+    bilateral_rgb_std: float = 5.0,
+) -> np.ndarray:
+    """
+    DenseCRF refinement for binary segmentation.
+
+    Args
+    ----
+    img_rgb      : HxWx3 uint8 image (DOP20 tile B).
+    score_map    : HxW float map, higher => more "LWF-like" (from kNN).
+    sh_mask      : optional HxW boolean mask. If given, we strongly
+                   discourage foreground outside this mask.
+    n_iters      : mean-field iterations in DenseCRF.
+    *_w, *_std   : pairwise term hyperparams (tunable, but these
+                   defaults usually work OK).
+
+    Returns
+    -------
+    refined_mask : HxW boolean array (True = foreground).
+    """
+    # Make sure shapes match
+    h, w, _ = img_rgb.shape
+    assert score_map.shape == (h, w), "score_map must have shape (H, W)"
+
+    # --- 1) turn score_map into foreground probability -----------------
+    # Normalize scores to [0, 1] (per-tile) to behave like probabilities.
+    s = score_map.astype(np.float32)
+    s_min, s_max = float(s.min()), float(s.max())
+    if s_max > s_min:
+        p_fg = (s - s_min) / (s_max - s_min)
+    else:
+        # Degenerate map: fall back to 0.5 everywhere
+        p_fg = np.full_like(s, 0.5, dtype=np.float32)
+
+    # Clamp to avoid log(0)
+    eps = 1e-6
+    p_fg = np.clip(p_fg, eps, 1.0 - eps)
+
+    # Respect SH_2022 buffer: outside buffer, force near-zero FG prob
+    if sh_mask is not None:
+        sh_mask = sh_mask.astype(bool)
+        p_fg[~sh_mask] = eps  # almost certainly background
+
+    p_bg = 1.0 - p_fg
+
+    # Shape for unary_from_softmax: (C, H, W)
+    probs = np.stack([p_bg, p_fg], axis=0)
+
+    # --- 2) build DenseCRF2D model -------------------------------------
+    # DenseCRF2D(width, height, n_classes)
+    d = dcrf.DenseCRF2D(w, h, 2)
+
+    # Unary energy from probabilities
+    unary = unary_from_softmax(probs)  # shape (2, H*W)
+    d.setUnaryEnergy(unary)
+
+    # --- 3) add pairwise terms -----------------------------------------
+    # (a) spatial smoothness (XY only)
+    d.addPairwiseGaussian(
+        sxy=(pos_xy_std, pos_xy_std),
+        compat=pos_w,
+        kernel=dcrf.DIAG_KERNEL,
+        normalization=dcrf.NORMALIZE_SYMMETRIC,
+    )
+
+    # (b) bilateral term in XY + RGB (aligns with color edges)
+    # make sure image is uint8
+    if img_rgb.dtype != np.uint8:
+        img_rgb_u8 = img_rgb.astype(np.uint8)
+    else:
+        img_rgb_u8 = img_rgb
+
+    d.addPairwiseBilateral(
+        sxy=(bilateral_xy_std, bilateral_xy_std),
+        srgb=(bilateral_rgb_std, bilateral_rgb_std, bilateral_rgb_std),
+        rgbim=img_rgb_u8,
+        compat=bilateral_w,
+        kernel=dcrf.DIAG_KERNEL,
+        normalization=dcrf.NORMALIZE_SYMMETRIC,
+    )
+
+    # --- 4) run mean-field inference -----------------------------------
+    Q = d.inference(n_iters)  # list of length 2, each H*W
+    Q = np.array(Q).reshape(2, h, w)
+    labels = np.argmax(Q, axis=0).astype(np.uint8)  # 0=bg, 1=fg
+
+    refined_mask = labels == 1
+
+    # (Optional) enforce SH buffer as a hard constraint as well
+    if sh_mask is not None:
+        refined_mask = np.logical_and(refined_mask, sh_mask)
+
+    return refined_mask
+
+
+def grid_search_k_threshold(
     img_b: np.ndarray,
+    pos_bank: np.ndarray,
     model,
     processor,
     device,
-    ps: int = 16,
-    tile_size: int = 1024,
-    stride: int | None = None,
-    k: int = 5,
-    pos_frac_thresh: float = 0.1,
-    threshold: float = 0.75,
-    aggregate_layers=None,
-    use_crf: bool = False,
-    refine_with_crf=None,
-    feature_dir: str | None = None,
-    image_id_a: str | None = None,
-    image_id_b: str | None = None,
-    save_features: bool = False,
+    ps: int,
+    tile_size: int,
+    stride: int | None,
+    k_values: list[int],
+    thresholds: list[float],
+    feature_dir: str,
+    image_id_b: str,
+    sh_buffer_mask_b: np.ndarray,
+    gt_mask_b: np.ndarray,
 ):
-    """
-    Public API for zero-shot transfer.
-    Single-scale internally, with timing prints for main stages.
+    best_config = None
+    best_score_full = None
+    best_saliency_full = None
+    best_iou = -1.0
 
-    If save_features is True and feature_dir + image_id_* are given,
-    per-tile DINO patch features for A and B are cached to disk.
-    """
-    t0_total = time_start()
-
-    feature_dir_a = feature_dir if save_features else None
-    feature_dir_b = feature_dir if save_features else None
-
-    pos_bank, neg_bank = build_banks_single_scale(
-        img_a=img_a,
-        labels_a=labels_a,
-        model=model,
-        processor=processor,
-        device=device,
-        ps=ps,
-        tile_size=tile_size,
-        stride=stride,
-        pos_frac_thresh=pos_frac_thresh,
-        aggregate_layers=aggregate_layers,
-        feature_dir=feature_dir_a,
-        image_id=image_id_a,
-    )
-
-    score_full, saliency_full = zero_shot_knn_single_scale_B_with_saliency(
-        img_b=img_b,
-        pos_bank=pos_bank,
-        model=model,
-        processor=processor,
-        device=device,
-        ps=ps,
-        tile_size=tile_size,
-        stride=stride,
-        k=k,
-        aggregate_layers=aggregate_layers,
-        feature_dir=feature_dir_b,
-        image_id=image_id_b,
-    )
-
-    mask_b = score_full >= threshold
-
-    if use_crf and refine_with_crf is not None:
-        coarse_labels = mask_b.astype(np.int32)
-        refined = refine_with_crf(
-            img_b.astype(np.uint8),
-            coarse_labels,
-            n_classes=2,
+    for k in k_values:
+        score_full, saliency_full = zero_shot_knn_single_scale_B_with_saliency(
+            img_b=img_b,
+            pos_bank=pos_bank,
+            model=model,
+            processor=processor,
+            device=device,
+            ps=ps,
+            tile_size=tile_size,
+            stride=stride,
+            k=k,
+            aggregate_layers=None,
+            feature_dir=feature_dir,
+            image_id=image_id_b,
         )
-        mask_b = (refined == 1)
 
-    time_end("run_zero_shot_transfer (total)", t0_total)
+        for thr in thresholds:
+            mask_raw = score_full >= thr
+            mask_clipped = np.logical_and(mask_raw, sh_buffer_mask_b)
 
-    # basic visualization: A, labels, B+mask, saliency
-    fig, axs = plt.subplots(1, 3, figsize=(20, 7))
+            metrics = compute_metrics(mask_clipped, gt_mask_b)
+            iou = metrics["iou"]
+            f1 = metrics["f1"]
 
-    axs[0].imshow(img_a)
-    axs[0].set_title("Image A")
-    axs[0].axis("off")
+            print(
+                f"[eval] k={k}, thr={thr:.3f} -> "
+                f"IoU={iou:.3f}, F1={f1:.3f}, "
+                f"P={metrics['precision']:.3f}, R={metrics['recall']:.3f}"
+            )
 
-    axs[1].imshow(labels_a > 0, cmap="gray")
-    axs[1].set_title("Image A: label mask")
-    axs[1].axis("off")
+            if iou > best_iou:
+                best_iou = iou
+                best_config = {
+                    "k": k,
+                    "threshold": thr,
+                    **metrics,
+                }
+                best_score_full = score_full.copy()
+                best_saliency_full = saliency_full.copy()
 
-    axs[2].imshow(img_b)
-    axs[2].imshow(mask_b, cmap="Greens", alpha=0.4)
-    axs[2].set_title(f"Image B: zero-shot mask (t={threshold:.2f})")
-    axs[2].axis("off")
+    print("\n[best] configuration:")
+    print(best_config)
 
-    plt.tight_layout()
-    plt.show()
-
-    plt.figure(figsize=(8, 6))
-    plt.imshow(saliency_full, cmap="hot")
-    plt.title("Patch saliency (kNN contribution)")
-    plt.axis("off")
-    plt.show()
-
-    return {
-        "pos_bank": pos_bank,
-        "neg_bank": neg_bank,
-        "score_full": score_full,
-        "saliency_full": saliency_full,
-        "mask_b": mask_b,
-    }
+    return best_config, best_score_full, best_saliency_full
 
 
 # ----------------------------------------------------------------------
@@ -720,12 +793,6 @@ def run_zero_shot_transfer(
 def export_mask_to_shapefile(mask: np.ndarray,
                              ref_raster_path: str,
                              out_path: str):
-    """
-    Polygonize a boolean mask and export as ESRI Shapefile.
-    Uses the CRS and transform from ref_raster_path.
-
-    mask: HxW boolean or 0/1 array in the pixel grid of ref_raster_path.
-    """
     t0 = time_start()
 
     mask_uint8 = mask.astype("uint8")
@@ -776,39 +843,60 @@ def export_mask_to_shapefile(mask: np.ndarray,
 
 
 def main():
-    """
-    Minimal main that mirrors your original configuration, using
-    the cleaned single-scale runner, timing prints, shapefile export,
-    and DINO feature caching + consolidation per .tif.
-    """
     t0_main = time_start()
 
     model_name = "facebook/dinov3-vitl16-pretrain-sat493m"
     model, processor, device = init_model(model_name)
 
-    t0_data = time_start()
-
+    # ------------ paths ------------
     img_path = (
         "/home/mak/PycharmProjects/SegEdge/experiments/"
         "get_data_from_api/patches_mt/"
         "dop20_593000_5982000_1km_20cm.tif"
-    )
+    )  # Image A
     img2_path = (
         "/home/mak/PycharmProjects/SegEdge/experiments/"
         "get_data_from_api/patches_mt/"
         "dop20_592000_5982000_1km_20cm.tif"
-    )
+    )  # Image B
     lab_path = (
         "/run/media/mak/Partition of 1TB disk/SH_dataset/"
         "planet_labels_2022.tif"
-    )
+    )  # SH_2022 raster
+    gt_vector_path = (
+        "/home/mak/PycharmProjects/SegEdge/experiments/"
+        "get_data_from_api/patches_mt/"
+        "labels_final.shp"
+    )  # ground truth for 592000 tile
+
+    # ------------ data loading A/B ------------
+    t0_data = time_start()
 
     img = load_dop20_image(img_path)
-    labels_2d = reproject_labels_to_image(img_path, lab_path)
-    img_b = np.array(Image.open(img2_path).convert("RGB"))
+    labels_A = reproject_labels_to_image(img_path, lab_path)
 
-    time_end("data_loading", t0_data)
+    img_b = load_dop20_image(img2_path)
+    labels_SH_B = reproject_labels_to_image(img2_path, lab_path)
+    gt_mask_B = rasterize_vector_labels(gt_vector_path, img2_path)
 
+    time_end("data_loading_and_reprojection", t0_data)
+
+    # quick sanity check
+    print(f"[debug] GT positives on B: {gt_mask_B.sum()}")
+    print(f"[debug] SH_2022 positives on B: {(labels_SH_B > 0).sum()}")
+
+    # ------------ pixel size for buffer ------------
+    with rasterio.open(img2_path) as src:
+        pixel_size_m = abs(src.transform.a)
+
+    buffer_m = 2.0
+    buffer_pixels = int(round(buffer_m / pixel_size_m))
+    print(
+        f"[info] pixel_size={pixel_size_m:.3f} m, "
+        f"buffer_m={buffer_m}, buffer_pixels={buffer_pixels}"
+    )
+
+    # ------------ feature cache folder ------------
     feature_dir = os.path.join(
         os.path.dirname(img_path),
         "dino_features",
@@ -817,44 +905,138 @@ def main():
     image_id_a = os.path.splitext(os.path.basename(img_path))[0]
     image_id_b = os.path.splitext(os.path.basename(img2_path))[0]
 
-    t0_run = time_start()
-    result = run_zero_shot_transfer(
+    # ------------ build bank on A ------------
+    pos_bank, neg_bank = build_banks_single_scale(
         img_a=img,
-        labels_a=labels_2d,
-        img_b=img_b,
+        labels_a=labels_A,
         model=model,
         processor=processor,
         device=device,
         ps=model.config.patch_size,
         tile_size=1024,
         stride=512,
-        k=2,
         pos_frac_thresh=0.1,
-        threshold=0.77,
         aggregate_layers=None,
         feature_dir=feature_dir,
-        image_id_a=image_id_a,
-        image_id_b=image_id_b,
-        save_features=True,
+        image_id=image_id_a,
     )
-    time_end("run_zero_shot_transfer (from main)", t0_run)
 
-    mask_b = result["mask_b"]
+    # ------------ SH_2022 buffer mask for B ------------
+    sh_buffer_mask_B = build_sh_buffer_mask(labels_SH_B, buffer_pixels)
 
+    # ------------ grid search on B ------------
+    K_VALUES = list(range(1, 30))
+    THRESHOLDS = np.linspace(0.1, 0.9, 20).tolist()
+
+    best_config, best_score_full, best_saliency_full = grid_search_k_threshold(
+        img_b=img_b,
+        pos_bank=pos_bank,
+        model=model,
+        processor=processor,
+        device=device,
+        ps=model.config.patch_size,
+        tile_size=1024,
+        stride=512,
+        k_values=K_VALUES,
+        thresholds=THRESHOLDS,
+        feature_dir=feature_dir,
+        image_id_b=image_id_b,
+        sh_buffer_mask_b=sh_buffer_mask_B,
+        gt_mask_b=gt_mask_B,
+    )
+
+    k_best = best_config["k"]
+    thr_best = best_config["threshold"]
+
+    mask_raw_best = best_score_full >= thr_best
+    mask_best = np.logical_and(mask_raw_best, sh_buffer_mask_B)
+
+
+    # ------------ CRF refinement on best score map ------------
+    # Use the *score map* of the best config as unary,
+    # not the hard thresholded mask.
+    mask_crf = refine_with_densecrf(
+        img_rgb=img_b,
+        score_map=best_score_full,
+        sh_mask=sh_buffer_mask_B,  # respect SH buffer
+        n_iters=5,
+    )
+
+    metrics_crf = compute_metrics(mask_crf, gt_mask_B)
+    print(
+        f"[crf] IoU={metrics_crf['iou']:.3f}, "
+        f"F1={metrics_crf['f1']:.3f}, "
+        f"P={metrics_crf['precision']:.3f}, "
+        f"R={metrics_crf['recall']:.3f}"
+    )
+
+    # ------------ visualization for best run + CRF ------------
+    fig, axs = plt.subplots(1, 5, figsize=(30, 6))
+
+    axs[0].imshow(img_b)
+    axs[0].set_title("Image B (RGB)")
+    axs[0].axis("off")
+
+    axs[1].imshow(labels_SH_B > 0, cmap="gray")
+    axs[1].set_title("SH_2022 raster (B)")
+    axs[1].axis("off")
+
+    axs[2].imshow(gt_mask_B > 0, cmap="gray")
+    axs[2].set_title("Ground truth (labels_final)")
+    axs[2].axis("off")
+
+    # kNN + threshold + buffer
+    overlay_knn = img_b.copy()
+    overlay_mask_knn = mask_best
+    overlay_knn[overlay_mask_knn] = (
+            0.5 * overlay_knn[overlay_mask_knn] + 0.5 * np.array([0, 255, 0])
+    ).astype(overlay_knn.dtype)
+    axs[3].imshow(overlay_knn)
+    axs[3].set_title(
+        f"kNN mask (k={k_best}, thr={thr_best:.3f})\n"
+        f"IoU={best_config['iou']:.3f}, F1={best_config['f1']:.3f}"
+    )
+    axs[3].axis("off")
+
+    # CRF-refined mask
+    overlay_crf = img_b.copy()
+    overlay_mask_crf = mask_crf
+    overlay_crf[overlay_mask_crf] = (
+            0.5 * overlay_crf[overlay_mask_crf] + 0.5 * np.array([255, 0, 0])
+    ).astype(overlay_crf.dtype)
+    axs[4].imshow(overlay_crf)
+    axs[4].set_title(
+        f"CRF-refined mask\n"
+        f"IoU={metrics_crf['iou']:.3f}, F1={metrics_crf['f1']:.3f}"
+    )
+    axs[4].axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
+    # ------------ shapefile export for best mask ------------
     base_name_b = os.path.splitext(os.path.basename(img2_path))[0]
     out_dir_b = os.path.dirname(img2_path)
-    shp_path = os.path.join(out_dir_b, f"{base_name_b}_pred_mask.shp")
+    shp_path = os.path.join(out_dir_b, f"{base_name_b}_pred_mask_best_crf.shp")
 
-    export_mask_to_shapefile(mask=mask_b,
-                             ref_raster_path=img2_path,
-                             out_path=shp_path)
+    export_mask_to_shapefile(
+        mask=mask_crf,
+        ref_raster_path=img2_path,
+        out_path=shp_path,
+    )
 
+    # ------------ consolidate features per .tif (A and B) ------------
     consolidate_features_for_image(feature_dir, image_id_a)
     consolidate_features_for_image(feature_dir, image_id_b)
 
     time_end("main (total)", t0_main)
 
-    return result
+    return {
+        "best_config": best_config,
+        "best_mask": mask_best,
+        "best_score_full": best_score_full,
+        "best_saliency_full": best_saliency_full,
+    }
 
 
 if __name__ == "__main__":
