@@ -11,14 +11,13 @@ import torch
 import matplotlib.pyplot as plt
 
 from PIL import Image
-from sklearn.neighbors import NearestNeighbors
 from skimage.transform import resize
 from skimage.morphology import erosion, disk
 
 import rasterio
 from rasterio.plot import reshape_as_image
 from rasterio.warp import reproject, Resampling
-from rasterio.features import shapes
+import rasterio.features as rfeatures
 
 import fiona
 
@@ -37,7 +36,6 @@ def time_start():
     Start a timing block.
 
     Returns a timestamp or None if DEBUG_TIMING is disabled.
-    This keeps call overhead minimal when timing is off.
     """
     if not DEBUG_TIMING:
         return None
@@ -72,7 +70,6 @@ def init_model(model_name: str):
     processor = AutoImageProcessor.from_pretrained(model_name)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # eval() because we never train the backbone here.
     model = AutoModel.from_pretrained(model_name)
     model.eval()
     model.to(device)
@@ -110,7 +107,6 @@ def reproject_labels_to_image(ref_img_path: str, labels_path: str) -> np.ndarray
         dst_meta = ref.meta.copy()
         dst_meta.update(dtype=src.dtypes[0], count=src.count)
 
-        # Use in-memory dataset as reprojection target.
         memfile = rasterio.io.MemoryFile()
         with memfile.open(**dst_meta) as dst:
             for i in range(1, src.count + 1):
@@ -127,7 +123,6 @@ def reproject_labels_to_image(ref_img_path: str, labels_path: str) -> np.ndarray
                 )
             labels_arr = dst.read()
 
-    # Use first band as label image; matches DOP20 ref grid.
     labels_2d = labels_arr[0]
     return labels_2d
 
@@ -211,7 +206,6 @@ def labels_to_patch_masks(labels_tile: np.ndarray,
     labels_c = labels_tile[:hp * patch_h, :wp * patch_w]
     labels_bin = (labels_c > 0).astype(np.float32)
 
-    # Blocks: (Hp, patch_h, Wp, patch_w)
     blocks = labels_bin.reshape(hp, patch_h, wp, patch_w)
     frac_pos = blocks.mean(axis=(1, 3))  # (Hp, Wp)
 
@@ -227,9 +221,6 @@ def tile_feature_path(feature_dir: str,
                       x: int) -> str:
     """
     Build a unique file path for a tile's DINO features.
-
-    Rationale:
-    - Centralizes naming so load/save use the same convention.
     """
     fname = f"{image_id}_y{y}_x{x}_features.npy"
     return os.path.join(feature_dir, fname)
@@ -244,9 +235,6 @@ def save_tile_features(feats_tile: np.ndarray,
     Save per-tile DINO features to disk.
 
     feats_tile: (Hp, Wp, C) array for this tile.
-    feature_dir: base directory for all cached features.
-    image_id: identifier derived from the .tif basename.
-    y, x: top-left pixel indices of the tile in the full image.
     """
     os.makedirs(feature_dir, exist_ok=True)
     fpath = tile_feature_path(feature_dir, image_id, y, x)
@@ -340,7 +328,6 @@ def extract_patch_features_single_scale(image_hw3: np.ndarray,
             layers = [hidden_states[i] for i in aggregate_layers]
             tokens = torch.stack(layers, dim=0).mean(0)
 
-    # Some DINOv3 variants carry register tokens.
     reg_tokens = getattr(model.config, "num_register_tokens", 0)
     patch_tokens = tokens[:, 1 + reg_tokens:, :]  # drop CLS + registers
 
@@ -390,7 +377,6 @@ def build_banks_single_scale(img_a: np.ndarray,
     cached_tiles = 0
     computed_tiles = 0
 
-    # Erode labels to avoid boundary noise in the positive bank.
     labels_eroded = erosion((labels_a > 0).astype(bool), disk(2))
 
     for y, x, img_tile, lab_tile in tile_iterator(img_a,
@@ -475,7 +461,7 @@ def build_banks_single_scale(img_a: np.ndarray,
 
 
 # ----------------------------------------------------------------------
-# 6. single-scale zero-shot scoring on Image B (with caching)
+# 6. single-scale zero-shot scoring on Image B (GPU kNN + caching)
 # ----------------------------------------------------------------------
 
 
@@ -496,14 +482,16 @@ def zero_shot_knn_single_scale_B_with_saliency(
     """
     Single-scale zero-shot kNN scoring and saliency map on Image B.
 
+    GPU version:
+    - Move pos_bank to device once.
+    - For each tile, move its patch features to device.
+    - Compute cosine similarities via batched matmul and top-k.
+
     Score: mean cosine similarity of each patch to its k nearest
     positive-bank neighbours.
 
     Saliency: simple kNN-weighted similarity (higher => contributes
     more strongly to being classified as 'like positives').
-
-    If feature_dir and image_id are given, per-tile DINO features are
-    cached on disk and reused on subsequent runs.
     """
     t0 = time_start()
 
@@ -516,13 +504,9 @@ def zero_shot_knn_single_scale_B_with_saliency(
     cached_tiles = 0
     computed_tiles = 0
 
-    nn = NearestNeighbors(
-        n_neighbors=min(k, max(1, len(pos_bank))),
-        metric="cosine",
-        algorithm="brute",
-        n_jobs=-1,  # parallelize brute-force distance computation
-    )
-    nn.fit(pos_bank)
+    # Move pos_bank once to GPU (or CPU device if no CUDA).
+    pos_bank_t = torch.from_numpy(pos_bank.astype(np.float32)).to(device)
+    k_eff = min(k, pos_bank_t.shape[0])
 
     for y, x, img_tile, _ in tile_iterator(img_b, None, tile_size, stride):
         img_c, _, h_eff, w_eff = crop_to_multiple_of_ps(
@@ -562,10 +546,15 @@ def zero_shot_knn_single_scale_B_with_saliency(
                     x=x,
                 )
 
-        x_feats = feats_tile.reshape(-1, feats_tile.shape[-1])
+        # Flatten tile patches: (Hp, Wp, C) -> (Nb, C)
+        x_feats = feats_tile.reshape(-1, feats_tile.shape[-1]).astype(np.float32)
 
-        dists, _ = nn.kneighbors(x_feats, return_distance=True)
-        sims = 1.0 - dists
+        # GPU kNN via cosine similarity (dot product on L2-normalized features).
+        with torch.no_grad():
+            x_feats_t = torch.from_numpy(x_feats).to(device)  # (Nb, C)
+            sims_full = x_feats_t @ pos_bank_t.t()            # (Nb, Npos)
+            sims_topk, _ = torch.topk(sims_full, k=k_eff, dim=1)
+            sims = sims_topk.cpu().numpy()                    # (Nb, k_eff)
 
         # score: mean similarity over k neighbours
         score_patch = sims.mean(axis=1).reshape(hp, wp)
@@ -599,7 +588,7 @@ def zero_shot_knn_single_scale_B_with_saliency(
     score_full[mask_nonzero] /= weight_full[mask_nonzero]
     saliency_full[mask_nonzero] /= weight_full[mask_nonzero]
 
-    time_end("zero_shot_knn_single_scale_B_with_saliency", t0)
+    time_end("zero_shot_knn_single_scale_B_with_saliency (GPU)", t0)
     print(
         f"[cache] B: cached tiles={cached_tiles}, "
         f"computed tiles={computed_tiles}"
@@ -739,19 +728,15 @@ def export_mask_to_shapefile(mask: np.ndarray,
     """
     t0 = time_start()
 
-    # Ensure 0/1 uint8 for shapes().
     mask_uint8 = mask.astype("uint8")
 
-    # Read georeferencing from reference raster (Image B).
     with rasterio.open(ref_raster_path) as src:
         transform = src.transform
         crs = src.crs
 
-    # shapes() yields (geometry, value) in geojson-like mappings.
-    # We only keep polygons where value == 1.
-    shape_generator = shapes(mask_uint8,
-                             mask=mask_uint8 == 1,
-                             transform=transform)
+    shape_generator = rfeatures.shapes(mask_uint8,
+                                       mask=mask_uint8 == 1,
+                                       transform=transform)
 
     schema = {
         "geometry": "Polygon",
@@ -760,7 +745,6 @@ def export_mask_to_shapefile(mask: np.ndarray,
         },
     }
 
-    # Ensure output directory exists.
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
     with fiona.open(
@@ -825,7 +809,6 @@ def main():
 
     time_end("data_loading", t0_data)
 
-    # feature cache folder
     feature_dir = os.path.join(
         os.path.dirname(img_path),
         "dino_features",
@@ -836,9 +819,9 @@ def main():
 
     t0_run = time_start()
     result = run_zero_shot_transfer(
-        img_a=img,                  # DOP20 tile A
-        labels_a=labels_2d,         # reprojected Planet mask
-        img_b=img_b,                # DOP20 tile B
+        img_a=img,
+        labels_a=labels_2d,
+        img_b=img_b,
         model=model,
         processor=processor,
         device=device,
@@ -856,7 +839,6 @@ def main():
     )
     time_end("run_zero_shot_transfer (from main)", t0_run)
 
-    # --- Shapefile export for mask_b ---
     mask_b = result["mask_b"]
 
     base_name_b = os.path.splitext(os.path.basename(img2_path))[0]
@@ -867,7 +849,6 @@ def main():
                              ref_raster_path=img2_path,
                              out_path=shp_path)
 
-    # --- Consolidate features per .tif (A and B) ---
     consolidate_features_for_image(feature_dir, image_id_a)
     consolidate_features_for_image(feature_dir, image_id_b)
 
