@@ -9,9 +9,12 @@
 #   validation threshold search.
 # - DenseCRF refinement with unary calibrated around the best validation
 #   threshold instead of min-max.
+# - Extended: negative bank scoring (pos - alpha * neg), more timing, oracle
+#   upper bound for SH buffer, and CRF hyperparameter grid search.
 
 import time
 import os
+import concurrent.futures
 
 import numpy as np
 import torch
@@ -33,16 +36,29 @@ from shapely.geometry import shape, mapping
 from shapely.ops import transform as shp_transform
 from pyproj import Transformer
 
+# Optional fast morphology backend
+try:
+    import cv2
+    _HAS_CV2 = True
+except ImportError:
+    _HAS_CV2 = False
+
 from transformers import AutoImageProcessor, AutoModel
 from pydensecrf import densecrf as dcrf
 from pydensecrf.utils import unary_from_softmax
 
 
 # ----------------------------------------------------------------------
-# 0. timing utilities
+# 0. timing utilities + global config
 # ----------------------------------------------------------------------
 
 DEBUG_TIMING = True
+DEBUG_TIMING_VERBOSE = False  # set True to time lightweight helpers (log noisy)
+USE_FP16_KNN = True  # set True to speed up matmul on GPU; may slightly change scores
+USE_GPU_THRESHOLD_METRICS = True  # evaluate threshold grid on GPU in batch
+THRESHOLD_BATCH_SIZE = 8  # chunk size for GPU threshold evaluation to avoid OOM
+CRF_MAX_CONFIGS = 64  # limit CRF grid to avoid huge runtimes
+THRESHOLD_CPU_BATCH_SIZE = 16  # CPU chunk size for batched threshold eval
 
 
 def time_start():
@@ -56,6 +72,11 @@ def time_end(label: str, t0):
         return
     dt = time.perf_counter() - t0
     print(f"[time] {label}: {dt:.3f} s")
+
+
+# Negative bank config
+MAX_NEG_BANK = 8000      # max number of negative patches (will subsample if larger)
+NEG_ALPHA = 1.0          # score = pos_mean - NEG_ALPHA * neg_mean
 
 
 # ----------------------------------------------------------------------
@@ -84,15 +105,18 @@ def init_model(model_name: str):
 
 
 def load_dop20_image(path: str) -> np.ndarray:
+    t0 = time_start()
     with rasterio.open(path) as src:
         arr = src.read()  # (bands, H, W)
     img = reshape_as_image(arr)  # (H, W, C)
     if img.shape[2] > 3:
         img = img[:, :, :3]
+    time_end(f"load_dop20_image[{os.path.basename(path)}]", t0)
     return img
 
 
 def reproject_labels_to_image(ref_img_path: str, labels_path: str) -> np.ndarray:
+    t0 = time_start()
     with rasterio.open(ref_img_path) as ref, rasterio.open(labels_path) as src:
         dst_meta = ref.meta.copy()
         dst_meta.update(dtype=src.dtypes[0], count=src.count)
@@ -114,6 +138,10 @@ def reproject_labels_to_image(ref_img_path: str, labels_path: str) -> np.ndarray
             labels_arr = dst.read()
 
     labels_2d = labels_arr[0]
+    time_end(
+        f"reproject_labels_to_image[{os.path.basename(labels_path)} -> {os.path.basename(ref_img_path)}]",
+        t0,
+    )
     return labels_2d
 
 
@@ -183,8 +211,12 @@ def rasterize_vector_labels(vector_path: str,
 
 
 def l2_normalize(feats: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    t0 = time.perf_counter() if DEBUG_TIMING and DEBUG_TIMING_VERBOSE else None
     norms = np.linalg.norm(feats, axis=-1, keepdims=True) + eps
-    return feats / norms
+    out = feats / norms
+    if DEBUG_TIMING and DEBUG_TIMING_VERBOSE:
+        time_end("l2_normalize", t0)
+    return out
 
 
 def tile_iterator(image_hw3: np.ndarray,
@@ -216,6 +248,7 @@ def tile_iterator(image_hw3: np.ndarray,
 def crop_to_multiple_of_ps(img_tile_hw3: np.ndarray,
                            labels_tile_hw: np.ndarray | None,
                            ps: int):
+    t0 = time.perf_counter() if DEBUG_TIMING and DEBUG_TIMING_VERBOSE else None
     h, w = img_tile_hw3.shape[:2]
     h_eff = (h // ps) * ps
     w_eff = (w // ps) * ps
@@ -226,6 +259,8 @@ def crop_to_multiple_of_ps(img_tile_hw3: np.ndarray,
     else:
         lab_c = None
 
+    if DEBUG_TIMING and DEBUG_TIMING_VERBOSE:
+        time_end("crop_to_multiple_of_ps", t0)
     return img_c, lab_c, h_eff, w_eff
 
 
@@ -233,6 +268,7 @@ def labels_to_patch_masks(labels_tile: np.ndarray,
                           hp: int,
                           wp: int,
                           pos_frac_thresh: float = 0.1):
+    t0 = time.perf_counter() if DEBUG_TIMING and DEBUG_TIMING_VERBOSE else None
     h_eff, w_eff = labels_tile.shape
     patch_h = h_eff // hp
     patch_w = w_eff // wp
@@ -246,6 +282,8 @@ def labels_to_patch_masks(labels_tile: np.ndarray,
     pos_mask = frac_pos >= pos_frac_thresh
     neg_mask = frac_pos == 0.0
 
+    if DEBUG_TIMING and DEBUG_TIMING_VERBOSE:
+        time_end("labels_to_patch_masks", t0)
     return pos_mask, neg_mask
 
 
@@ -320,6 +358,7 @@ def extract_patch_features_single_scale(image_hw3: np.ndarray,
                                         device,
                                         ps: int = 16,
                                         aggregate_layers=None):
+    t0 = time_start()
     inputs = processor(
         images=image_hw3,
         return_tensors="pt",
@@ -354,6 +393,7 @@ def extract_patch_features_single_scale(image_hw3: np.ndarray,
     feats = patch_tokens[0].cpu().numpy().reshape(hp, wp, dim)
     feats = l2_normalize(feats)
 
+    time_end("extract_patch_features_single_scale", t0)
     return feats, hp, wp
 
 
@@ -373,8 +413,21 @@ def build_banks_single_scale(img_a: np.ndarray,
                              pos_frac_thresh: float = 0.1,
                              aggregate_layers=None,
                              feature_dir: str | None = None,
-                             image_id: str | None = None):
+                             image_id: str | None = None,
+                             bank_cache_dir: str | None = None):
     t0 = time_start()
+
+    # Shortcut: load cached banks if available
+    if bank_cache_dir is not None and image_id is not None:
+        os.makedirs(bank_cache_dir, exist_ok=True)
+        pos_cache_path = os.path.join(bank_cache_dir, f"{image_id}_pos_bank.npy")
+        neg_cache_path = os.path.join(bank_cache_dir, f"{image_id}_neg_bank.npy")
+        if os.path.exists(pos_cache_path):
+            pos_bank = np.load(pos_cache_path)
+            neg_bank = np.load(neg_cache_path) if os.path.exists(neg_cache_path) else None
+            time_end("build_banks_single_scale(load_cache)", t0)
+            print(f"[cache] loaded banks from {bank_cache_dir}")
+            return pos_bank, neg_bank
 
     pos_list = []
     neg_list = []
@@ -455,53 +508,66 @@ def build_banks_single_scale(img_a: np.ndarray,
     if neg_bank is not None:
         print(f"Negative bank size: {len(neg_bank)} patches")
 
+        # Subsample negatives if too large (helps GPU memory / speed)
+        if len(neg_bank) > MAX_NEG_BANK:
+            rng = np.random.default_rng(42)
+            idx = rng.choice(len(neg_bank), size=MAX_NEG_BANK, replace=False)
+            neg_bank_sub = neg_bank[idx]
+            print(
+                f"[info] subsampled negative bank from {len(neg_bank)} "
+                f"to {len(neg_bank_sub)} patches (MAX_NEG_BANK={MAX_NEG_BANK})"
+            )
+            neg_bank = neg_bank_sub
+
     time_end("build_banks_single_scale", t0)
     print(
         f"[cache] A: cached tiles={cached_tiles}, "
         f"computed tiles={computed_tiles}"
     )
 
+    if bank_cache_dir is not None and image_id is not None:
+        os.makedirs(bank_cache_dir, exist_ok=True)
+        pos_cache_path = os.path.join(bank_cache_dir, f"{image_id}_pos_bank.npy")
+        neg_cache_path = os.path.join(bank_cache_dir, f"{image_id}_neg_bank.npy")
+        np.save(pos_cache_path, pos_bank.astype(np.float32))
+        if neg_bank is not None:
+            np.save(neg_cache_path, neg_bank.astype(np.float32))
+        print(f"[cache] saved banks to {bank_cache_dir}")
+
     return pos_bank, neg_bank
 
 
 # ----------------------------------------------------------------------
-# 6. GPU kNN scoring on Image B (single-scale, cached features)
+# 5b. Optional prefetch of Image B features (single-scale, cached features)
 # ----------------------------------------------------------------------
 
 
-def zero_shot_knn_single_scale_B_with_saliency(
-    img_b: np.ndarray,
-    pos_bank: np.ndarray,
+def prefetch_features_single_scale_image(
+    img_hw3: np.ndarray,
     model,
     processor,
     device,
     ps: int = 16,
     tile_size: int = 1024,
     stride: int | None = None,
-    k: int = 5,
     aggregate_layers=None,
     feature_dir: str | None = None,
     image_id: str | None = None,
 ):
+    """
+    Preload / compute all tile features for a given image once, so grid-search
+    over multiple k values can reuse them without repeatedly hitting disk.
+    """
     t0 = time_start()
-
-    h_full, w_full = img_b.shape[:2]
-
-    score_full = np.zeros((h_full, w_full), dtype=np.float32)
-    saliency_full = np.zeros((h_full, w_full), dtype=np.float32)
-    weight_full = np.zeros((h_full, w_full), dtype=np.float32)
-
+    cache = {}
     cached_tiles = 0
     computed_tiles = 0
+    skipped_tiles = 0
 
-    pos_bank_t = torch.from_numpy(pos_bank.astype(np.float32)).to(device)
-    k_eff = min(k, pos_bank_t.shape[0])
-
-    for y, x, img_tile, _ in tile_iterator(img_b, None, tile_size, stride):
-        img_c, _, h_eff, w_eff = crop_to_multiple_of_ps(
-            img_tile, None, ps
-        )
+    for y, x, img_tile, _ in tile_iterator(img_hw3, None, tile_size, stride):
+        img_c, _, h_eff, w_eff = crop_to_multiple_of_ps(img_tile, None, ps)
         if h_eff < ps or w_eff < ps:
+            skipped_tiles += 1
             continue
 
         feats_tile = None
@@ -534,20 +600,179 @@ def zero_shot_knn_single_scale_B_with_saliency(
                     x=x,
                 )
 
+        cache[(y, x)] = {
+            "feats": feats_tile,
+            "h_eff": h_eff,
+            "w_eff": w_eff,
+            "hp": hp,
+            "wp": wp,
+        }
+
+    time_end("prefetch_features_single_scale_image", t0)
+    print(
+        "[prefetch] tiles="
+        f"{len(cache)} (cached={cached_tiles}, computed={computed_tiles}, "
+        f"skipped={skipped_tiles})"
+    )
+    return cache
+
+
+# ----------------------------------------------------------------------
+# 6. GPU kNN scoring on Image B (single-scale, cached features + optional prefetch)
+#     Extended to use negative bank: score = pos_mean - alpha * neg_mean
+# ----------------------------------------------------------------------
+
+
+def zero_shot_knn_single_scale_B_with_saliency(
+    img_b: np.ndarray,
+    pos_bank: np.ndarray,
+    neg_bank: np.ndarray | None,
+    model,
+    processor,
+    device,
+    ps: int = 16,
+    tile_size: int = 1024,
+    stride: int | None = None,
+    k: int = 5,
+    aggregate_layers=None,
+    feature_dir: str | None = None,
+    image_id: str | None = None,
+    neg_alpha: float = 1.0,
+    prefetched_tiles: dict | None = None,
+    use_fp16_matmul: bool = False,
+):
+    t0 = time_start()
+
+    h_full, w_full = img_b.shape[:2]
+
+    score_full = np.zeros((h_full, w_full), dtype=np.float32)
+    saliency_full = np.zeros((h_full, w_full), dtype=np.float32)
+    weight_full = np.zeros((h_full, w_full), dtype=np.float32)
+
+    cached_tiles = 0
+    computed_tiles = 0
+
+    pos_bank_t = torch.from_numpy(pos_bank.astype(np.float32)).to(device)
+    pos_bank_t_half = None
+    if use_fp16_matmul and device.type == "cuda":
+        pos_bank_t_half = pos_bank_t.half()
+    k_pos_eff = min(k, pos_bank_t.shape[0])
+
+    if neg_bank is not None:
+        neg_bank_t = torch.from_numpy(neg_bank.astype(np.float32)).to(device)
+        neg_bank_t_half = None
+        if use_fp16_matmul and device.type == "cuda":
+            neg_bank_t_half = neg_bank_t.half()
+        k_neg_eff = min(k, neg_bank_t.shape[0])
+        use_neg = True
+        print(f"[info] zero_shot: using negative bank with size={neg_bank_t.shape[0]}, "
+              f"k_neg_eff={k_neg_eff}, alpha={neg_alpha}")
+    else:
+        neg_bank_t = None
+        neg_bank_t_half = None
+        k_neg_eff = 0
+        use_neg = False
+        print("[info] zero_shot: negative bank disabled (neg_bank is None)")
+
+    matmul_time = 0.0
+    resize_time = 0.0
+
+    if prefetched_tiles is not None:
+        tile_iter = sorted(prefetched_tiles.items())
+        print(f"[perf] zero_shot: using prefetched features for {len(tile_iter)} tiles")
+    else:
+        tile_iter = tile_iterator(img_b, None, tile_size, stride)
+
+    for tile_entry in tile_iter:
+        t0_tile = time_start()
+        if prefetched_tiles is not None:
+            (y, x), feat_info = tile_entry
+            feats_tile = feat_info["feats"]
+            h_eff = feat_info["h_eff"]
+            w_eff = feat_info["w_eff"]
+            hp = feat_info["hp"]
+            wp = feat_info["wp"]
+            cached_tiles += 1  # already on disk/memory
+        else:
+            y, x, img_tile, _ = tile_entry
+
+            img_c, _, h_eff, w_eff = crop_to_multiple_of_ps(
+                img_tile, None, ps
+            )
+            if h_eff < ps or w_eff < ps:
+                time_end(f"zero_shot_tile_skip(y={y},x={x})", t0_tile)
+                continue
+
+            feats_tile = None
+            hp = wp = None
+
+            if feature_dir is not None and image_id is not None:
+                fpath = tile_feature_path(feature_dir, image_id, y, x)
+                if os.path.exists(fpath):
+                    feats_tile = np.load(fpath)
+                    hp, wp = feats_tile.shape[:2]
+                    cached_tiles += 1
+
+            if feats_tile is None:
+                feats_tile, hp, wp = extract_patch_features_single_scale(
+                    img_c,
+                    model,
+                    processor,
+                    device,
+                    ps=ps,
+                    aggregate_layers=aggregate_layers,
+                )
+                computed_tiles += 1
+
+                if feature_dir is not None and image_id is not None:
+                    save_tile_features(
+                        feats_tile,
+                        feature_dir=feature_dir,
+                        image_id=image_id,
+                        y=y,
+                        x=x,
+                    )
+
         x_feats = feats_tile.reshape(-1, feats_tile.shape[-1]).astype(np.float32)
 
         with torch.no_grad():
             x_feats_t = torch.from_numpy(x_feats).to(device)      # (Nb, C)
-            sims_full = x_feats_t @ pos_bank_t.t()                # (Nb, Npos)
-            sims_topk, _ = torch.topk(sims_full, k=k_eff, dim=1)
-            sims = sims_topk.cpu().numpy()                        # (Nb, k_eff)
+            if use_fp16_matmul and device.type == "cuda":
+                x_feats_t = x_feats_t.half()
+                pos_bank_local = pos_bank_t_half
+                neg_bank_local = neg_bank_t_half
+            else:
+                pos_bank_local = pos_bank_t
+                neg_bank_local = neg_bank_t
 
-        score_patch = sims.mean(axis=1).reshape(hp, wp)
+            t_matmul0 = time.perf_counter() if DEBUG_TIMING else None
 
-        weights = sims / (sims.sum(axis=1, keepdims=True) + 1e-8)
-        saliency_vals = (weights * sims).sum(axis=1)
+            # Positive sims
+            sims_pos_full = x_feats_t @ pos_bank_local.t()        # (Nb, Npos)
+            sims_pos_topk, _ = torch.topk(sims_pos_full, k=k_pos_eff, dim=1)
+            score_pos = sims_pos_topk.mean(dim=1)                 # (Nb,)
+
+            if use_neg:
+                sims_neg_full = x_feats_t @ neg_bank_local.t()    # (Nb, Nneg)
+                sims_neg_topk, _ = torch.topk(sims_neg_full, k=k_neg_eff, dim=1)
+                score_neg = sims_neg_topk.mean(dim=1)             # (Nb,)
+                score_batch = score_pos - neg_alpha * score_neg   # (Nb,)
+            else:
+                score_batch = score_pos                           # (Nb,)
+
+            if DEBUG_TIMING and t_matmul0 is not None:
+                matmul_time += time.perf_counter() - t_matmul0
+
+        # score map for this tile
+        score_patch = score_batch.cpu().numpy().reshape(hp, wp)
+
+        # saliency: just use positive sims as before
+        sims_pos = sims_pos_topk.float().cpu().numpy()            # (Nb, k_pos_eff)
+        weights = sims_pos / (sims_pos.sum(axis=1, keepdims=True) + 1e-8)
+        saliency_vals = (weights * sims_pos).sum(axis=1)
         saliency_patch = saliency_vals.reshape(hp, wp)
 
+        t_resize0 = time.perf_counter() if DEBUG_TIMING else None
         score_tile = resize(
             score_patch,
             (h_eff, w_eff),
@@ -568,6 +793,11 @@ def zero_shot_knn_single_scale_B_with_saliency(
         saliency_full[y:y + h_eff, x:x + w_eff] += saliency_tile
         weight_full[y:y + h_eff, x:x + w_eff] += 1.0
 
+        if DEBUG_TIMING and t_resize0 is not None:
+            resize_time += time.perf_counter() - t_resize0
+
+        time_end(f"zero_shot_tile(y={y},x={x},k={k})", t0_tile)
+
     mask_nonzero = weight_full > 0.0
     score_full[mask_nonzero] /= weight_full[mask_nonzero]
     saliency_full[mask_nonzero] /= weight_full[mask_nonzero]
@@ -577,25 +807,40 @@ def zero_shot_knn_single_scale_B_with_saliency(
         f"[cache] B: cached tiles={cached_tiles}, "
         f"computed tiles={computed_tiles}"
     )
+    if DEBUG_TIMING:
+        print(
+            f"[perf] k={k} matmul_time={matmul_time:.2f}s, "
+            f"resize_time={resize_time:.2f}s"
+        )
 
     return score_full, saliency_full
 
 
 # ----------------------------------------------------------------------
-# 7. SH_2022 clipping + metrics
+# 7. SH_2022 clipping + metrics + oracle upper bound
 # ----------------------------------------------------------------------
 
 
 def build_sh_buffer_mask(labels_sh: np.ndarray,
                          buffer_pixels: int) -> np.ndarray:
+    t0 = time_start()
     base = labels_sh > 0
     if buffer_pixels <= 0:
+        time_end("build_sh_buffer_mask", t0)
         return base
-    buf = dilation(base.astype(bool), disk(buffer_pixels))
+    if _HAS_CV2:
+        # OpenCV is significantly faster for large structuring elements
+        ksize = 2 * buffer_pixels + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+        buf = cv2.dilate(base.astype(np.uint8), kernel).astype(bool)
+    else:
+        buf = dilation(base.astype(bool), disk(buffer_pixels))
+    time_end("build_sh_buffer_mask", t0)
     return buf
 
 
 def compute_metrics(pred_mask: np.ndarray, gt_mask: np.ndarray) -> dict:
+    t0 = time.perf_counter() if DEBUG_TIMING and DEBUG_TIMING_VERBOSE else None
     pred = pred_mask.astype(bool)
     gt = gt_mask.astype(bool)
 
@@ -610,7 +855,7 @@ def compute_metrics(pred_mask: np.ndarray, gt_mask: np.ndarray) -> dict:
     iou = tp / (tp + fp + fn + eps)
     f1 = 2.0 * precision * recall / (precision + recall + eps)
 
-    return {
+    metrics = {
         "tp": int(tp),
         "fp": int(fp),
         "fn": int(fn),
@@ -620,6 +865,134 @@ def compute_metrics(pred_mask: np.ndarray, gt_mask: np.ndarray) -> dict:
         "iou": float(iou),
         "f1": float(f1),
     }
+    if DEBUG_TIMING and DEBUG_TIMING_VERBOSE:
+        time_end("compute_metrics", t0)
+    return metrics
+
+
+def compute_metrics_batch_gpu(score_map: np.ndarray,
+                              thresholds: list[float],
+                              sh_mask: np.ndarray | None,
+                              gt_mask: np.ndarray,
+                              device: torch.device,
+                              batch_size: int = 8) -> list[dict]:
+    """
+    Evaluate multiple thresholds in parallel on GPU to speed up grid search.
+    """
+    t0 = time_start()
+    score_t = torch.from_numpy(score_map.astype(np.float32)).to(device).flatten()
+    gt_t = torch.from_numpy(gt_mask.astype(np.bool_)).to(device).flatten()
+    if sh_mask is not None:
+        sh_t = torch.from_numpy(sh_mask.astype(np.bool_)).to(device).flatten()
+    else:
+        sh_t = None
+
+    metrics = []
+    eps = 1e-8
+
+    for start in range(0, len(thresholds), batch_size):
+        thr_chunk = thresholds[start:start + batch_size]
+        thr_t = torch.tensor(thr_chunk, device=device, dtype=torch.float32).view(-1, 1)
+
+        mask_thr = score_t.unsqueeze(0) >= thr_t  # (T, N)
+        if sh_t is not None:
+            mask_thr = mask_thr & sh_t
+
+        tp = (mask_thr & gt_t).sum(dim=1).float()
+        fp = (mask_thr & (~gt_t)).sum(dim=1).float()
+        fn = ((~mask_thr) & gt_t).sum(dim=1).float()
+        tn = ((~mask_thr) & (~gt_t)).sum(dim=1).float()
+
+        precision = tp / (tp + fp + eps)
+        recall = tp / (tp + fn + eps)
+        iou = tp / (tp + fp + fn + eps)
+        f1 = 2.0 * precision * recall / (precision + recall + eps)
+
+        for i, thr in enumerate(thr_chunk):
+            metrics.append({
+                "threshold": float(thr),
+                "tp": int(tp[i].item()),
+                "fp": int(fp[i].item()),
+                "fn": int(fn[i].item()),
+                "tn": int(tn[i].item()),
+                "precision": float(precision[i].item()),
+                "recall": float(recall[i].item()),
+                "iou": float(iou[i].item()),
+                "f1": float(f1[i].item()),
+            })
+
+    time_end("compute_metrics_batch_gpu", t0)
+    return metrics
+
+
+def compute_metrics_batch_cpu(score_map: np.ndarray,
+                              thresholds: list[float],
+                              sh_mask: np.ndarray | None,
+                              gt_mask: np.ndarray,
+                              batch_size: int = 16) -> list[dict]:
+    """
+    CPU batched threshold evaluation to reduce Python overhead; chunked to limit RAM.
+    """
+    t0 = time_start()
+    flat_scores = score_map.astype(np.float32).reshape(1, -1)  # (1, N)
+    flat_gt = gt_mask.astype(bool).reshape(1, -1)
+    if sh_mask is not None:
+        flat_sh = sh_mask.astype(bool).reshape(1, -1)
+    else:
+        flat_sh = None
+
+    metrics = []
+    eps = 1e-8
+
+    for start in range(0, len(thresholds), batch_size):
+        thr_chunk = np.array(thresholds[start:start + batch_size], dtype=np.float32).reshape(-1, 1)
+        mask = flat_scores >= thr_chunk  # (B, N)
+        if flat_sh is not None:
+            mask = np.logical_and(mask, flat_sh)
+
+        tp = np.logical_and(mask, flat_gt).sum(axis=1).astype(np.float64)
+        fp = np.logical_and(mask, ~flat_gt).sum(axis=1).astype(np.float64)
+        fn = np.logical_and(~mask, flat_gt).sum(axis=1).astype(np.float64)
+        tn = np.logical_and(~mask, ~flat_gt).sum(axis=1).astype(np.float64)
+
+        precision = tp / (tp + fp + eps)
+        recall = tp / (tp + fn + eps)
+        iou = tp / (tp + fp + fn + eps)
+        f1 = 2.0 * precision * recall / (precision + recall + eps)
+
+        for i, thr in enumerate(thr_chunk[:, 0]):
+            metrics.append({
+                "threshold": float(thr),
+                "tp": int(tp[i]),
+                "fp": int(fp[i]),
+                "fn": int(fn[i]),
+                "tn": int(tn[i]),
+                "precision": float(precision[i]),
+                "recall": float(recall[i]),
+                "iou": float(iou[i]),
+                "f1": float(f1[i]),
+            })
+
+    time_end("compute_metrics_batch_cpu", t0)
+    return metrics
+
+
+def compute_oracle_upper_bound(gt_mask: np.ndarray,
+                               sh_mask: np.ndarray) -> dict:
+    """
+    Oracle IoU if you are not allowed to predict outside SH buffer:
+    IoU( gt ∧ buffer , gt ).
+    """
+    t0 = time_start()
+    oracle_mask = np.logical_and(gt_mask.astype(bool), sh_mask.astype(bool))
+    metrics = compute_metrics(oracle_mask, gt_mask)
+    print(
+        "[oracle] SH buffer upper bound -> "
+        f"IoU={metrics['iou']:.3f}, F1={metrics['f1']:.3f}, "
+        f"P={metrics['precision']:.3f}, R={metrics['recall']:.3f}"
+    )
+    time_end("oracle_upper_bound_SH_buffer", t0)
+    return metrics
 
 
 # ----------------------------------------------------------------------
@@ -657,6 +1030,26 @@ def compute_slic_superpixels(
     return segments
 
 
+def precompute_superpixel_scores_mean(score_map: np.ndarray,
+                                      segments: np.ndarray) -> np.ndarray:
+    """
+    Precompute superpixel-average scores for mode='mean_score'.
+    """
+    t0 = time_start()
+    h, w = score_map.shape
+    flat_scores = score_map.reshape(-1)
+    flat_segs = segments.reshape(-1)
+    n_sp = int(flat_segs.max()) + 1
+
+    sums = np.bincount(flat_segs, weights=flat_scores, minlength=n_sp)
+    counts = np.bincount(flat_segs, minlength=n_sp)
+    mean_scores = sums / (counts + 1e-8)
+
+    sp_scores_full = mean_scores[flat_segs].reshape(h, w)
+    time_end("precompute_superpixel_scores_mean", t0)
+    return sp_scores_full
+
+
 def refine_with_superpixels(
     img_rgb: np.ndarray,
     score_map: np.ndarray,
@@ -692,6 +1085,7 @@ def refine_with_superpixels(
     -------
     sp_mask      : HxW boolean array (True = foreground).
     """
+    t0 = time_start()
     h, w = score_map.shape
     assert img_rgb.shape[:2] == (h, w), "img_rgb and score_map must match in HxW"
 
@@ -734,6 +1128,7 @@ def refine_with_superpixels(
     if sh_mask is not None:
         sp_mask = np.logical_and(sp_mask, sh_mask.astype(bool))
 
+    time_end("refine_with_superpixels", t0)
     return sp_mask
 
 
@@ -774,6 +1169,7 @@ def refine_with_densecrf(
     -------
     refined_mask : HxW boolean array (True = foreground).
     """
+    t0 = time_start()
     h, w, _ = img_rgb.shape
     assert score_map.shape == (h, w), "score_map must have shape (H, W)"
 
@@ -781,7 +1177,6 @@ def refine_with_densecrf(
     s = score_map.astype(np.float32)
 
     # Logistic centred at threshold_center
-    # logit_fg = (s - threshold_center) / prob_softness
     logits_fg = (s - threshold_center) / prob_softness
     p_fg = 1.0 / (1.0 + np.exp(-logits_fg))
 
@@ -843,18 +1238,225 @@ def refine_with_densecrf(
     if sh_mask is not None:
         refined_mask = np.logical_and(refined_mask, sh_mask)
 
+    time_end("refine_with_densecrf", t0)
     return refined_mask
+
+
+def crf_grid_search(
+    img_rgb: np.ndarray,
+    score_map: np.ndarray,
+    threshold_center: float,
+    sh_mask: np.ndarray,
+    gt_mask: np.ndarray,
+    prob_softness_vals,
+    pos_w_vals,
+    pos_xy_std_vals,
+    bilateral_w_vals,
+    bilateral_xy_std_vals,
+    bilateral_rgb_std_vals,
+    n_iters: int = 5,
+    max_configs: int | None = None,
+    downsample_factor: int = 1,
+    num_workers: int = 1,
+):
+    """
+    Small grid search over CRF hyperparameters for a fixed (k, thr)
+    champion configuration.
+    """
+    t0 = time_start()
+    best_cfg = None
+    best_mask = None
+    best_iou = -1.0
+    cfg_counter = 0
+
+    if downsample_factor > 1:
+        # Coarse search on downsampled data for speed
+        img_rgb_ds = resize(
+            img_rgb,
+            (img_rgb.shape[0] // downsample_factor, img_rgb.shape[1] // downsample_factor),
+            order=1,
+            preserve_range=True,
+            anti_aliasing=True,
+        ).astype(img_rgb.dtype)
+        score_map_ds = resize(
+            score_map,
+            (score_map.shape[0] // downsample_factor, score_map.shape[1] // downsample_factor),
+            order=1,
+            preserve_range=True,
+            anti_aliasing=True,
+        ).astype(np.float32)
+        sh_mask_ds = resize(
+            sh_mask.astype(np.float32),
+            (sh_mask.shape[0] // downsample_factor, sh_mask.shape[1] // downsample_factor),
+            order=0,
+            preserve_range=True,
+            anti_aliasing=False,
+        ) > 0.5
+        gt_mask_ds = resize(
+            gt_mask.astype(np.float32),
+            (gt_mask.shape[0] // downsample_factor, gt_mask.shape[1] // downsample_factor),
+            order=0,
+            preserve_range=True,
+            anti_aliasing=False,
+        ) > 0.5
+    else:
+        img_rgb_ds = img_rgb
+        score_map_ds = score_map
+        sh_mask_ds = sh_mask
+        gt_mask_ds = gt_mask
+
+    cfg_list = []
+    for prob_soft in prob_softness_vals:
+        for pos_w in pos_w_vals:
+            for pos_xy in pos_xy_std_vals:
+                for bi_w in bilateral_w_vals:
+                    for bi_xy in bilateral_xy_std_vals:
+                        for bi_rgb in bilateral_rgb_std_vals:
+                            cfg_list.append((prob_soft, pos_w, pos_xy, bi_w, bi_xy, bi_rgb))
+
+    if max_configs is not None:
+        cfg_list = cfg_list[:max_configs]
+
+    def run_cfg(cfg):
+        prob_soft, pos_w, pos_xy, bi_w, bi_xy, bi_rgb = cfg
+        print(
+            "[crf] evaluating config: "
+            f"soft={prob_soft}, pos_w={pos_w}, pos_xy={pos_xy}, "
+            f"bi_w={bi_w}, bi_xy={bi_xy}, bi_rgb={bi_rgb}"
+        )
+        t_cfg = time_start()
+        mask_crf_local = refine_with_densecrf(
+            img_rgb=img_rgb_ds,
+            score_map=score_map_ds,
+            threshold_center=threshold_center,
+            sh_mask=sh_mask_ds,
+            prob_softness=prob_soft,
+            n_iters=n_iters,
+            pos_w=pos_w,
+            pos_xy_std=pos_xy,
+            bilateral_w=bi_w,
+            bilateral_xy_std=bi_xy,
+            bilateral_rgb_std=bi_rgb,
+        )
+        time_end("crf_single_config", t_cfg)
+
+        metrics_local = compute_metrics(mask_crf_local, gt_mask_ds)
+        print(
+            f"[crf-eval] soft={prob_soft}, pos_w={pos_w}, pos_xy={pos_xy}, "
+            f"bi_w={bi_w}, bi_xy={bi_xy}, bi_rgb={bi_rgb} -> "
+            f"IoU={metrics_local['iou']:.3f}, F1={metrics_local['f1']:.3f}, "
+            f"P={metrics_local['precision']:.3f}, R={metrics_local['recall']:.3f}"
+        )
+        return metrics_local, mask_crf_local, {
+            "prob_softness": prob_soft,
+            "pos_w": pos_w,
+            "pos_xy_std": pos_xy,
+            "bilateral_w": bi_w,
+            "bilateral_xy_std": bi_xy,
+            "bilateral_rgb_std": bi_rgb,
+            **metrics_local,
+        }
+
+    if num_workers > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as ex:
+            futures = [ex.submit(run_cfg, cfg) for cfg in cfg_list]
+            for fut in concurrent.futures.as_completed(futures):
+                metrics, mask_crf, cfg_full = fut.result()
+                if metrics["iou"] > best_iou:
+                    best_iou = metrics["iou"]
+                    best_cfg = cfg_full
+                    best_mask = mask_crf
+    else:
+        for cfg in cfg_list:
+            metrics, mask_crf, cfg_full = run_cfg(cfg)
+            if metrics["iou"] > best_iou:
+                best_iou = metrics["iou"]
+                best_cfg = cfg_full
+                best_mask = mask_crf
+
+    time_end("crf_grid_search", t0)
+    print("\n[crf] best CRF configuration:")
+    print(best_cfg)
+    return best_cfg, best_mask
 
 
 # ----------------------------------------------------------------------
 # 10. Grid search over k and threshold
 #     (raw + optional superpixel refinement)
+#     + optional fine threshold tuning around the best config
 # ----------------------------------------------------------------------
+
+
+def fine_tune_threshold(
+    score_map: np.ndarray,
+    base_threshold: float,
+    sh_mask: np.ndarray | None,
+    gt_mask: np.ndarray,
+    img_rgb: np.ndarray | None = None,
+    step: float = 0.01,
+    window: float = 0.08,
+    use_superpixels: bool = False,
+    sp_params: dict | None = None,
+):
+    """
+    Small 1D sweep around the coarse grid-search optimum to squeeze extra IoU.
+    """
+    t0 = time_start()
+    thr_min = max(0.0, base_threshold - window)
+    thr_max = min(1.0, base_threshold + window)
+    thr_vals = np.arange(thr_min, thr_max + 1e-8, step)
+
+    best_thr = base_threshold
+    best_metrics = None
+    best_mask = None
+    best_iou = -1.0
+
+    sp_scores = None
+    if use_superpixels and sp_params is not None:
+        if sp_params.get("mode", "mean_score") == "mean_score":
+            segments = sp_params.get("segments", None)
+            if segments is not None:
+                sp_scores = precompute_superpixel_scores_mean(score_map, segments)
+
+    for thr in thr_vals:
+        if use_superpixels:
+            if sp_scores is not None:
+                mask = sp_scores >= thr
+                if sh_mask is not None:
+                    mask = np.logical_and(mask, sh_mask)
+            else:
+                assert img_rgb is not None, "img_rgb is required for superpixel tuning"
+                mask = refine_with_superpixels(
+                    img_rgb=img_rgb,
+                    score_map=score_map,
+                    threshold=thr,
+                    sh_mask=sh_mask,
+                    **(sp_params or {}),
+                )
+        else:
+            mask = score_map >= thr
+            if sh_mask is not None:
+                mask = np.logical_and(mask, sh_mask)
+
+        metrics = compute_metrics(mask, gt_mask)
+        if metrics["iou"] > best_iou:
+            best_iou = metrics["iou"]
+            best_thr = thr
+            best_metrics = metrics
+            best_mask = mask
+
+    print(
+        f"[tune-thr] base={base_threshold:.3f} -> best={best_thr:.3f} "
+        f"IoU={best_metrics['iou']:.3f}, F1={best_metrics['f1']:.3f}"
+    )
+    time_end("fine_tune_threshold", t0)
+    return best_thr, best_metrics, best_mask
 
 
 def grid_search_k_threshold(
     img_b: np.ndarray,
     pos_bank: np.ndarray,
+    neg_bank: np.ndarray | None,
     model,
     processor,
     device,
@@ -867,8 +1469,10 @@ def grid_search_k_threshold(
     image_id_b: str,
     sh_buffer_mask_b: np.ndarray,
     gt_mask_b: np.ndarray,
-    use_superpixels: bool = True,
+    use_superpixels: bool = False,
     sp_params: dict | None = None,
+    prefetched_tiles_b: dict | None = None,
+    use_fp16_matmul: bool = False,
 ):
     """
     Grid search over (k, threshold).
@@ -877,6 +1481,8 @@ def grid_search_k_threshold(
         best_raw_config, best_raw_score_full, best_raw_saliency_full,
         best_sp_config,  best_sp_score_full
     """
+    t0 = time_start()
+
     if sp_params is None:
         sp_params = {}
 
@@ -890,9 +1496,12 @@ def grid_search_k_threshold(
     best_sp_iou = -1.0
 
     for k in k_values:
+        t0_k_total = time_start()
+        t0_k_score = time_start()
         score_full, saliency_full = zero_shot_knn_single_scale_B_with_saliency(
             img_b=img_b,
             pos_bank=pos_bank,
+            neg_bank=neg_bank,
             model=model,
             processor=processor,
             device=device,
@@ -903,14 +1512,45 @@ def grid_search_k_threshold(
             aggregate_layers=None,
             feature_dir=feature_dir,
             image_id=image_id_b,
+            neg_alpha=NEG_ALPHA,
+            prefetched_tiles=prefetched_tiles_b,
+            use_fp16_matmul=use_fp16_matmul,
         )
+        time_end(f"grid_search_score_full(k={k})", t0_k_score)
 
-        for thr in thresholds:
-            # ----- raw per-pixel mask -----
-            mask_raw = score_full >= thr
-            mask_raw = np.logical_and(mask_raw, sh_buffer_mask_b)
+        # Precompute SP scores once per k if using mean-score SP mode
+        sp_scores_full = None
+        if use_superpixels and sp_params.get("mode", "mean_score") == "mean_score":
+            segments = sp_params.get("segments", None)
+            if segments is not None:
+                sp_scores_full = precompute_superpixel_scores_mean(score_full, segments)
 
-            metrics_raw = compute_metrics(mask_raw, gt_mask_b)
+        # ----- raw per-pixel thresholds in batch (GPU if available) -----
+        if USE_GPU_THRESHOLD_METRICS and device.type == "cuda":
+            try:
+                metrics_raw_list = compute_metrics_batch_gpu(
+                    score_map=score_full,
+                    thresholds=thresholds,
+                    sh_mask=sh_buffer_mask_b,
+                    gt_mask=gt_mask_b,
+                    device=device,
+                    batch_size=THRESHOLD_BATCH_SIZE,
+                )
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                metrics_raw_list = None
+                print("[warn] OOM during GPU threshold metrics; falling back to CPU")
+        if metrics_raw_list is None:
+            metrics_raw_list = compute_metrics_batch_cpu(
+                score_map=score_full,
+                thresholds=thresholds,
+                sh_mask=sh_buffer_mask_b,
+                gt_mask=gt_mask_b,
+                batch_size=THRESHOLD_CPU_BATCH_SIZE,
+            )
+
+        for metrics_raw in metrics_raw_list:
+            thr = metrics_raw["threshold"]
             iou_raw = metrics_raw["iou"]
             f1_raw = metrics_raw["f1"]
 
@@ -932,36 +1572,69 @@ def grid_search_k_threshold(
                 best_raw_score_full = score_full.copy()
                 best_raw_saliency_full = saliency_full.copy()
 
-            # ----- superpixel-refined mask -----
-            if use_superpixels:
-                mask_sp = refine_with_superpixels(
-                    img_rgb=img_b,
-                    score_map=score_full,
-                    threshold=thr,
+        # ----- superpixel thresholds (still per-thr; could be batch if mean-score precomputed) -----
+        if use_superpixels:
+            if sp_scores_full is not None:
+                metrics_sp_list = compute_metrics_batch_cpu(
+                    score_map=sp_scores_full,
+                    thresholds=thresholds,
                     sh_mask=sh_buffer_mask_b,
-                    **sp_params,
+                    gt_mask=gt_mask_b,
+                    batch_size=THRESHOLD_CPU_BATCH_SIZE,
                 )
+                for metrics_sp in metrics_sp_list:
+                    thr = metrics_sp["threshold"]
+                    iou_sp = metrics_sp["iou"]
+                    f1_sp = metrics_sp["f1"]
+                    print(
+                        f"[eval-SP]  k={k}, thr={thr:.3f} -> "
+                        f"IoU={iou_sp:.3f}, F1={f1_sp:.3f}, "
+                        f"P={metrics_sp['precision']:.3f}, "
+                        f"R={metrics_sp['recall']:.3f}"
+                    )
+                    if iou_sp > best_sp_iou:
+                        best_sp_iou = iou_sp
+                        best_sp_config = {
+                            "k": k,
+                            "threshold": thr,
+                            "source": "superpixels",
+                            **metrics_sp,
+                        }
+                        best_sp_score_full = score_full.copy()
+            else:
+                for thr in thresholds:
+                    t_thr_sp = time_start()
+                    mask_sp = refine_with_superpixels(
+                        img_rgb=img_b,
+                        score_map=score_full,
+                        threshold=thr,
+                        sh_mask=sh_buffer_mask_b,
+                        **sp_params,
+                    )
 
-                metrics_sp = compute_metrics(mask_sp, gt_mask_b)
-                iou_sp = metrics_sp["iou"]
-                f1_sp = metrics_sp["f1"]
+                    metrics_sp = compute_metrics(mask_sp, gt_mask_b)
+                    iou_sp = metrics_sp["iou"]
+                    f1_sp = metrics_sp["f1"]
 
-                print(
-                    f"[eval-SP]  k={k}, thr={thr:.3f} -> "
-                    f"IoU={iou_sp:.3f}, F1={f1_sp:.3f}, "
-                    f"P={metrics_sp['precision']:.3f}, "
-                    f"R={metrics_sp['recall']:.3f}"
-                )
+                    print(
+                        f"[eval-SP]  k={k}, thr={thr:.3f} -> "
+                        f"IoU={iou_sp:.3f}, F1={f1_sp:.3f}, "
+                        f"P={metrics_sp['precision']:.3f}, "
+                        f"R={metrics_sp['recall']:.3f}"
+                    )
+                    time_end(f"threshold_SP(k={k},thr={thr:.3f})", t_thr_sp)
 
-                if iou_sp > best_sp_iou:
-                    best_sp_iou = iou_sp
-                    best_sp_config = {
-                        "k": k,
-                        "threshold": thr,
-                        "source": "superpixels",
-                        **metrics_sp,
-                    }
-                    best_sp_score_full = score_full.copy()
+                    if iou_sp > best_sp_iou:
+                        best_sp_iou = iou_sp
+                        best_sp_config = {
+                            "k": k,
+                            "threshold": thr,
+                            "source": "superpixels",
+                            **metrics_sp,
+                        }
+                        best_sp_score_full = score_full.copy()
+
+        time_end(f"k_loop_total(k={k})", t0_k_total)
 
     print("\n[best-raw] configuration:")
     print(best_raw_config)
@@ -969,6 +1642,8 @@ def grid_search_k_threshold(
     if best_sp_config is not None:
         print("\n[best-SP] configuration:")
         print(best_sp_config)
+
+    time_end("grid_search_k_threshold", t0)
 
     return (
         best_raw_config,
@@ -1114,26 +1789,35 @@ def main():
         aggregate_layers=None,
         feature_dir=feature_dir,
         image_id=image_id_a,
+        bank_cache_dir=os.path.join(feature_dir, "banks"),
     )
 
     # ------------ SH_2022 buffer mask for B ------------
     sh_buffer_mask_B = build_sh_buffer_mask(labels_SH_B, buffer_pixels)
 
-    # ------------ precompute SLIC superpixels for B ------------
-    sp_segments = compute_slic_superpixels(
-        img_rgb=img_b,
-        n_segments=12000,
-        compactness=10.0,
-        sigma=1.0,
-    )
-    sp_params = {
-        "segments": sp_segments,
-        "mode": "mean_score",
-        "sp_fg_frac_thresh": 0.5,  # used only for "majority" mode
-        # n_segments/compactness/sigma are ignored when segments provided
-    }
+    # ------------ oracle upper bound (only inside SH buffer allowed) ------------
+    _ = compute_oracle_upper_bound(gt_mask_B, sh_buffer_mask_B)
 
-    # ------------ grid search on B (raw + superpixels; no CRF) ------------
+    # ------------ precompute SLIC superpixels for B ------------
+    # Superpixels disabled (not helpful in this run)
+    sp_segments = None
+    sp_params = {}
+
+    # ------------ prefetch Image B features once for all k ------------
+    prefetched_b = prefetch_features_single_scale_image(
+        img_hw3=img_b,
+        model=model,
+        processor=processor,
+        device=device,
+        ps=model.config.patch_size,
+        tile_size=1024,
+        stride=512,
+        aggregate_layers=None,
+        feature_dir=feature_dir,
+        image_id=image_id_b,
+    )
+
+    # ------------ grid search on B (raw + superpixels) ------------
     K_VALUES = [1, 2, 3, 5, 7, 10, 15, 20, 25, 30, 45, 50, 75, 100]
     THRESHOLDS = np.linspace(0.1, 0.9, 20).tolist()
 
@@ -1146,6 +1830,7 @@ def main():
     ) = grid_search_k_threshold(
         img_b=img_b,
         pos_bank=pos_bank,
+        neg_bank=neg_bank,
         model=model,
         processor=processor,
         device=device,
@@ -1158,39 +1843,61 @@ def main():
         image_id_b=image_id_b,
         sh_buffer_mask_b=sh_buffer_mask_B,
         gt_mask_b=gt_mask_B,
-        use_superpixels=True,
+        use_superpixels=False,
         sp_params=sp_params,
+        prefetched_tiles_b=prefetched_b,
+        use_fp16_matmul=USE_FP16_KNN,
     )
 
-    # ------------ reconstruct best raw mask ------------
-    k_best_raw = best_raw_config["k"]
-    thr_best_raw = best_raw_config["threshold"]
+    # ------------ fine-tune thresholds around coarse optimum ------------
+    thr_best_raw_refined, metrics_raw_refined, mask_raw_best = fine_tune_threshold(
+        score_map=best_raw_score_full,
+        base_threshold=best_raw_config["threshold"],
+        sh_mask=sh_buffer_mask_B,
+        gt_mask=gt_mask_B,
+        img_rgb=img_b,
+        use_superpixels=False,
+    )
+    if metrics_raw_refined["iou"] >= best_raw_config["iou"]:
+        best_raw_config = {
+            **best_raw_config,
+            "threshold": thr_best_raw_refined,
+            **metrics_raw_refined,
+        }
+    else:
+        mask_raw_best = best_raw_score_full >= best_raw_config["threshold"]
+        mask_raw_best = np.logical_and(mask_raw_best, sh_buffer_mask_B)
 
-    mask_raw_best = best_raw_score_full >= thr_best_raw
-    mask_raw_best = np.logical_and(mask_raw_best, sh_buffer_mask_B)
-
-    # ------------ reconstruct best superpixel mask (if any) ------------
     if best_sp_config is not None:
-        k_best_sp = best_sp_config["k"]
-        thr_best_sp = best_sp_config["threshold"]
-        # score map for that k is best_sp_score_full
-        mask_sp_best = refine_with_superpixels(
-            img_rgb=img_b,
+        thr_best_sp_refined, metrics_sp_refined, mask_sp_best = fine_tune_threshold(
             score_map=best_sp_score_full,
-            threshold=thr_best_sp,
+            base_threshold=best_sp_config["threshold"],
             sh_mask=sh_buffer_mask_B,
-            **sp_params,
+            gt_mask=gt_mask_B,
+            img_rgb=img_b,
+            use_superpixels=True,
+            sp_params=sp_params,
         )
+        if metrics_sp_refined["iou"] >= best_sp_config["iou"]:
+            best_sp_config = {
+                **best_sp_config,
+                "threshold": thr_best_sp_refined,
+                **metrics_sp_refined,
+            }
+        else:
+            mask_sp_best = refine_with_superpixels(
+                img_rgb=img_b,
+                score_map=best_sp_score_full,
+                threshold=best_sp_config["threshold"],
+                sh_mask=sh_buffer_mask_B,
+                **sp_params,
+            )
     else:
         mask_sp_best = None
 
     # ------------ choose champion (raw vs SP) for CRF calibration ------------
-    if best_sp_config is not None and best_sp_config["iou"] > best_raw_config["iou"]:
-        champion_config = best_sp_config
-        champion_score_full = best_sp_score_full
-    else:
-        champion_config = best_raw_config
-        champion_score_full = best_raw_score_full
+    champion_config = best_raw_config
+    champion_score_full = best_raw_score_full
 
     thr_center_for_crf = champion_config["threshold"]
     k_center_for_crf = champion_config["k"]
@@ -1199,76 +1906,59 @@ def main():
     print(f"      source={champion_config['source']}, "
           f"k={k_center_for_crf}, thr_center={thr_center_for_crf:.3f}")
 
-    # ------------ CRF search over candidate ks around champion k ------------
-    k_min = min(K_VALUES)
-    k_max = max(K_VALUES)
-    candidate_ks = sorted({
-        k for k in [
-            k_center_for_crf - 2,
-            k_center_for_crf - 1,
-            k_center_for_crf,
-            k_center_for_crf + 1,
-            k_center_for_crf + 2,
-        ]
-        if k_min <= k <= k_max
-    })
+    # ------------ CRF hyperparameter search for champion (single k) ------------
+    print("\n[crf] starting CRF hyperparameter search (single k)")
 
-    print(f"[crf] candidate ks: {candidate_ks}")
+    PROB_SOFTNESS_VALUES = [0.03, 0.05, 0.08]
+    POS_W_VALUES = [3.0, 4.0]
+    POS_XY_STD_VALUES = [3.0]
+    BILATERAL_W_VALUES = [5.0, 7.0]
+    BILATERAL_XY_STD_VALUES = [25.0, 50.0]
+    BILATERAL_RGB_STD_VALUES = [3.0, 5.0]
 
-    best_crf_iou = -1.0
-    best_crf_metrics = None
-    best_crf_k = None
-    best_crf_mask = None
-    best_crf_score = None
+    best_crf_cfg_inner, best_crf_mask = crf_grid_search(
+        img_rgb=img_b,
+        score_map=champion_score_full,
+        threshold_center=thr_center_for_crf,
+        sh_mask=sh_buffer_mask_B,
+        gt_mask=gt_mask_B,
+        prob_softness_vals=PROB_SOFTNESS_VALUES,
+        pos_w_vals=POS_W_VALUES,
+        pos_xy_std_vals=POS_XY_STD_VALUES,
+        bilateral_w_vals=BILATERAL_W_VALUES,
+        bilateral_xy_std_vals=BILATERAL_XY_STD_VALUES,
+        bilateral_rgb_std_vals=BILATERAL_RGB_STD_VALUES,
+        n_iters=5,
+        max_configs=CRF_MAX_CONFIGS,
+        downsample_factor=2,
+        num_workers=16,
+    )
 
-    for k_crf in candidate_ks:
-        print(f"[crf] evaluating CRF for k={k_crf}")
-
-        # recompute score map for this k (will reuse cached tile features)
-        score_full_k, _ = zero_shot_knn_single_scale_B_with_saliency(
-            img_b=img_b,
-            pos_bank=pos_bank,
-            model=model,
-            processor=processor,
-            device=device,
-            ps=model.config.patch_size,
-            tile_size=1024,
-            stride=512,
-            k=k_crf,
-            aggregate_layers=None,
-            feature_dir=feature_dir,
-            image_id=image_id_b,
-        )
-
-        # CRF refinement (uses continuous score map, not threshold)
-        mask_crf_k = refine_with_densecrf(
-            img_rgb=img_b,
-            score_map=score_full_k,
-            threshold_center=thr_center_for_crf,
-            sh_mask=sh_buffer_mask_B,
-            prob_softness=0.05,
-            n_iters=5,
-        )
-
-        metrics_crf_k = compute_metrics(mask_crf_k, gt_mask_B)
-        print(
-            f"[crf] k={k_crf} -> "
-            f"IoU={metrics_crf_k['iou']:.3f}, "
-            f"F1={metrics_crf_k['f1']:.3f}, "
-            f"P={metrics_crf_k['precision']:.3f}, "
-            f"R={metrics_crf_k['recall']:.3f}"
-        )
-
-        if metrics_crf_k["iou"] > best_crf_iou:
-            best_crf_iou = metrics_crf_k["iou"]
-            best_crf_metrics = metrics_crf_k
-            best_crf_k = k_crf
-            best_crf_mask = mask_crf_k
-            best_crf_score = score_full_k
-
-    print("\n[crf] best CRF configuration:")
-    best_crf_config = {"k": best_crf_k, **best_crf_metrics}
+    best_crf_config = {"k": k_center_for_crf, **best_crf_cfg_inner}
+    print("\n[crf] best CRF configuration with k:")
     print(best_crf_config)
+
+    # If CRF was run on downsampled data, upsample mask back to full res
+    if best_crf_mask.shape != img_b.shape[:2]:
+        best_crf_mask_full = resize(
+            best_crf_mask.astype(np.float32),
+            (img_b.shape[0], img_b.shape[1]),
+            order=0,
+            preserve_range=True,
+            anti_aliasing=False,
+        ) > 0.5
+        print(
+            f"[crf] upsampled best CRF mask from {best_crf_mask.shape} "
+            f"to {best_crf_mask_full.shape}"
+        )
+        best_crf_mask = best_crf_mask_full
+        metrics_crf_full = compute_metrics(best_crf_mask, gt_mask_B)
+        print(
+            f"[crf-upsampled] IoU={metrics_crf_full['iou']:.3f}, "
+            f"F1={metrics_crf_full['f1']:.3f}, "
+            f"P={metrics_crf_full['precision']:.3f}, "
+            f"R={metrics_crf_full['recall']:.3f}"
+        )
 
     # ------------ visualization: raw vs SP vs CRF ------------
     fig, axs = plt.subplots(2, 3, figsize=(24, 12))
@@ -1324,8 +2014,8 @@ def main():
     ).astype(overlay_crf.dtype)
     axs[1, 2].imshow(overlay_crf)
     axs[1, 2].set_title(
-        f"CRF (k={best_crf_k}, center_thr={thr_center_for_crf:.3f})\n"
-        f"IoU={best_crf_metrics['iou']:.3f}, F1={best_crf_metrics['f1']:.3f}"
+        f"CRF (k={best_crf_config['k']}, center_thr={thr_center_for_crf:.3f})\n"
+        f"IoU={best_crf_config['iou']:.3f}, F1={best_crf_config['f1']:.3f}"
     )
     axs[1, 2].axis("off")
 
@@ -1374,7 +2064,7 @@ def main():
         "best_sp_config": best_sp_config,
         "best_sp_score_full": best_sp_score_full,
         "best_crf_config": best_crf_config,
-        "best_crf_score_full": best_crf_score,
+        "best_crf_score_full": champion_score_full,
     }
 
 
