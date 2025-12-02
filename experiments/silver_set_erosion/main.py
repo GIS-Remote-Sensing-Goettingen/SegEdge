@@ -15,6 +15,7 @@
 import time
 import os
 import concurrent.futures
+from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import torch
@@ -1242,6 +1243,45 @@ def refine_with_densecrf(
     return refined_mask
 
 
+def _crf_eval_worker(args):
+    """
+    Helper for process-based CRF evaluation to leverage multiple CPU cores.
+    Returns metrics and the config; mask is recomputed for the best config later.
+    """
+    (img_rgb_ds,
+     score_map_ds,
+     sh_mask_ds,
+     gt_mask_ds,
+     threshold_center,
+     n_iters,
+     cfg) = args
+
+    prob_soft, pos_w, pos_xy, bi_w, bi_xy, bi_rgb = cfg
+    mask_crf_local = refine_with_densecrf(
+        img_rgb=img_rgb_ds,
+        score_map=score_map_ds,
+        threshold_center=threshold_center,
+        sh_mask=sh_mask_ds,
+        prob_softness=prob_soft,
+        n_iters=n_iters,
+        pos_w=pos_w,
+        pos_xy_std=pos_xy,
+        bilateral_w=bi_w,
+        bilateral_xy_std=bi_xy,
+        bilateral_rgb_std=bi_rgb,
+    )
+    metrics_local = compute_metrics(mask_crf_local, gt_mask_ds)
+    return metrics_local, {
+        "prob_softness": prob_soft,
+        "pos_w": pos_w,
+        "pos_xy_std": pos_xy,
+        "bilateral_w": bi_w,
+        "bilateral_xy_std": bi_xy,
+        "bilateral_rgb_std": bi_rgb,
+        **metrics_local,
+    }
+
+
 def crf_grid_search(
     img_rgb: np.ndarray,
     score_map: np.ndarray,
@@ -1258,6 +1298,7 @@ def crf_grid_search(
     max_configs: int | None = None,
     downsample_factor: int = 1,
     num_workers: int = 1,
+    backend: str = "process",  # "process" or "thread"
 ):
     """
     Small grid search over CRF hyperparameters for a fixed (k, thr)
@@ -1317,62 +1358,85 @@ def crf_grid_search(
     if max_configs is not None:
         cfg_list = cfg_list[:max_configs]
 
-    def run_cfg(cfg):
-        prob_soft, pos_w, pos_xy, bi_w, bi_xy, bi_rgb = cfg
-        print(
-            "[crf] evaluating config: "
-            f"soft={prob_soft}, pos_w={pos_w}, pos_xy={pos_xy}, "
-            f"bi_w={bi_w}, bi_xy={bi_xy}, bi_rgb={bi_rgb}"
-        )
-        t_cfg = time_start()
-        mask_crf_local = refine_with_densecrf(
+    if num_workers > 1 and backend == "process":
+        # Process-based parallelism to utilize multiple CPU cores
+        with ProcessPoolExecutor(max_workers=num_workers) as ex:
+            args_iter = [
+                (
+                    img_rgb_ds,
+                    score_map_ds,
+                    sh_mask_ds,
+                    gt_mask_ds,
+                    threshold_center,
+                    n_iters,
+                    cfg,
+                )
+                for cfg in cfg_list
+            ]
+            for metrics, cfg_full in ex.map(_crf_eval_worker, args_iter):
+                if metrics["iou"] > best_iou:
+                    best_iou = metrics["iou"]
+                    best_cfg = cfg_full
+    else:
+        # Threaded or single-thread fallback
+        for cfg in cfg_list:
+            prob_soft, pos_w, pos_xy, bi_w, bi_xy, bi_rgb = cfg
+            print(
+                "[crf] evaluating config: "
+                f"soft={prob_soft}, pos_w={pos_w}, pos_xy={pos_xy}, "
+                f"bi_w={bi_w}, bi_xy={bi_xy}, bi_rgb={bi_rgb}"
+            )
+            t_cfg = time_start()
+            mask_crf_local = refine_with_densecrf(
+                img_rgb=img_rgb_ds,
+                score_map=score_map_ds,
+                threshold_center=threshold_center,
+                sh_mask=sh_mask_ds,
+                prob_softness=prob_soft,
+                n_iters=n_iters,
+                pos_w=pos_w,
+                pos_xy_std=pos_xy,
+                bilateral_w=bi_w,
+                bilateral_xy_std=bi_xy,
+                bilateral_rgb_std=bi_rgb,
+            )
+            time_end("crf_single_config", t_cfg)
+
+            metrics_local = compute_metrics(mask_crf_local, gt_mask_ds)
+            print(
+                f"[crf-eval] soft={prob_soft}, pos_w={pos_w}, pos_xy={pos_xy}, "
+                f"bi_w={bi_w}, bi_xy={bi_xy}, bi_rgb={bi_rgb} -> "
+                f"IoU={metrics_local['iou']:.3f}, F1={metrics_local['f1']:.3f}, "
+                f"P={metrics_local['precision']:.3f}, R={metrics_local['recall']:.3f}"
+            )
+            if metrics_local["iou"] > best_iou:
+                best_iou = metrics_local["iou"]
+                best_cfg = {
+                    "prob_softness": prob_soft,
+                    "pos_w": pos_w,
+                    "pos_xy_std": pos_xy,
+                    "bilateral_w": bi_w,
+                    "bilateral_xy_std": bi_xy,
+                    "bilateral_rgb_std": bi_rgb,
+                    **metrics_local,
+                }
+                best_mask = mask_crf_local
+
+    # Recompute best mask once (to avoid passing large masks between processes)
+    if best_cfg is not None and best_mask is None:
+        best_mask = refine_with_densecrf(
             img_rgb=img_rgb_ds,
             score_map=score_map_ds,
             threshold_center=threshold_center,
             sh_mask=sh_mask_ds,
-            prob_softness=prob_soft,
+            prob_softness=best_cfg["prob_softness"],
             n_iters=n_iters,
-            pos_w=pos_w,
-            pos_xy_std=pos_xy,
-            bilateral_w=bi_w,
-            bilateral_xy_std=bi_xy,
-            bilateral_rgb_std=bi_rgb,
+            pos_w=best_cfg["pos_w"],
+            pos_xy_std=best_cfg["pos_xy_std"],
+            bilateral_w=best_cfg["bilateral_w"],
+            bilateral_xy_std=best_cfg["bilateral_xy_std"],
+            bilateral_rgb_std=best_cfg["bilateral_rgb_std"],
         )
-        time_end("crf_single_config", t_cfg)
-
-        metrics_local = compute_metrics(mask_crf_local, gt_mask_ds)
-        print(
-            f"[crf-eval] soft={prob_soft}, pos_w={pos_w}, pos_xy={pos_xy}, "
-            f"bi_w={bi_w}, bi_xy={bi_xy}, bi_rgb={bi_rgb} -> "
-            f"IoU={metrics_local['iou']:.3f}, F1={metrics_local['f1']:.3f}, "
-            f"P={metrics_local['precision']:.3f}, R={metrics_local['recall']:.3f}"
-        )
-        return metrics_local, mask_crf_local, {
-            "prob_softness": prob_soft,
-            "pos_w": pos_w,
-            "pos_xy_std": pos_xy,
-            "bilateral_w": bi_w,
-            "bilateral_xy_std": bi_xy,
-            "bilateral_rgb_std": bi_rgb,
-            **metrics_local,
-        }
-
-    if num_workers > 1:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as ex:
-            futures = [ex.submit(run_cfg, cfg) for cfg in cfg_list]
-            for fut in concurrent.futures.as_completed(futures):
-                metrics, mask_crf, cfg_full = fut.result()
-                if metrics["iou"] > best_iou:
-                    best_iou = metrics["iou"]
-                    best_cfg = cfg_full
-                    best_mask = mask_crf
-    else:
-        for cfg in cfg_list:
-            metrics, mask_crf, cfg_full = run_cfg(cfg)
-            if metrics["iou"] > best_iou:
-                best_iou = metrics["iou"]
-                best_cfg = cfg_full
-                best_mask = mask_crf
 
     time_end("crf_grid_search", t0)
     print("\n[crf] best CRF configuration:")
@@ -1729,7 +1793,7 @@ def main():
         "dop20_592000_5982000_1km_20cm.tif"
     )  # Image B
     lab_path = (
-        "/run/media/mak/Partition of 1TB disk/SH_dataset/"
+        "/mnt/nvme1n1p5/SH_dataset/"
         "planet_labels_2022.tif"
     )  # SH_2022 raster
     gt_vector_path = (
@@ -1818,8 +1882,8 @@ def main():
     )
 
     # ------------ grid search on B (raw + superpixels) ------------
-    K_VALUES = [1, 2, 3, 5, 7, 10, 15, 20, 25, 30, 45, 50, 75, 100]
-    THRESHOLDS = np.linspace(0.1, 0.9, 20).tolist()
+    K_VALUES = [1, 2, 3, 5, 7, 10, 15, 20, 25, 30, 45, 50, 75, 100, 150, 200 ,300 , 500 ]
+    THRESHOLDS = np.linspace(0.01, 0.9, 50).tolist()
 
     (
         best_raw_config,
@@ -1932,6 +1996,7 @@ def main():
         max_configs=CRF_MAX_CONFIGS,
         downsample_factor=2,
         num_workers=16,
+        backend="process",
     )
 
     best_crf_config = {"k": k_center_for_crf, **best_crf_cfg_inner}
