@@ -4,6 +4,7 @@
 import os
 import numpy as np
 import torch
+from skimage.transform import resize
 
 import config as cfg
 from timing_utils import time_start, time_end, DEBUG_TIMING
@@ -40,100 +41,6 @@ def init_model(model_name: str):
     model.to(device)
     time_end("init_model", t0)
     return model, processor, device
-
-
-def fine_tune_threshold(score_map: np.ndarray,
-                        base_threshold: float,
-                        sh_mask: np.ndarray | None,
-                        gt_mask: np.ndarray,
-                        step: float = 0.01,
-                        window: float = 0.08):
-    t0 = time_start()
-    thr_min = max(0.0, base_threshold - window)
-    thr_max = min(1.0, base_threshold + window)
-    thr_vals = np.arange(thr_min, thr_max + 1e-8, step)
-
-    best_thr = base_threshold
-    best_metrics = None
-    best_mask = None
-    best_iou = -1.0
-
-    for thr in thr_vals:
-        mask = score_map >= thr
-        if sh_mask is not None:
-            mask = np.logical_and(mask, sh_mask)
-        metrics = compute_metrics(mask, gt_mask)
-        if metrics["iou"] > best_iou:
-            best_iou = metrics["iou"]
-            best_thr = thr
-            best_metrics = metrics
-            best_mask = mask
-
-    print(
-        f"[tune-thr] base={base_threshold:.3f} -> best={best_thr:.3f} "
-        f"IoU={best_metrics['iou']:.3f}, F1={best_metrics['f1']:.3f}"
-    )
-    time_end("fine_tune_threshold", t0)
-    return best_thr, best_metrics, best_mask
-
-
-def save_plot(img_b, gt_mask_B, mask_raw_best, best_raw_config, best_crf_mask, best_crf_config, thr_center_for_crf, plot_dir, image_id_b):
-    fig, axs = plt.subplots(2, 2, figsize=(16, 12))
-    axs[0, 0].imshow(img_b)
-    axs[0, 0].set_title("Image B (RGB)")
-    axs[0, 0].axis("off")
-
-    axs[0, 1].imshow(gt_mask_B > 0, cmap="gray")
-    axs[0, 1].set_title("Ground truth (labels_final)")
-    axs[0, 1].axis("off")
-
-    overlay_raw = img_b.copy()
-    overlay_raw[mask_raw_best] = (0.5 * overlay_raw[mask_raw_best] + 0.5 * np.array([0, 255, 0])).astype(overlay_raw.dtype)
-    axs[1, 0].imshow(overlay_raw)
-    axs[1, 0].set_title(
-        f"Raw kNN (k={best_raw_config['k']}, thr={best_raw_config['threshold']:.3f})\n"
-        f"IoU={best_raw_config['iou']:.3f}, F1={best_raw_config['f1']:.3f}"
-    )
-    axs[1, 0].axis("off")
-
-    overlay_crf = img_b.copy()
-    overlay_crf[best_crf_mask] = (0.5 * overlay_crf[best_crf_mask] + 0.5 * np.array([255, 0, 0])).astype(overlay_crf.dtype)
-    axs[1, 1].imshow(overlay_crf)
-    axs[1, 1].set_title(
-        f"CRF (k={best_crf_config['k']}, center_thr={thr_center_for_crf:.3f})\n"
-        f"IoU={best_crf_config['iou']:.3f}, F1={best_crf_config['f1']:.3f}"
-    )
-    axs[1, 1].axis("off")
-
-    plt.tight_layout()
-    os.makedirs(plot_dir, exist_ok=True)
-    plot_path = os.path.join(plot_dir, f"{image_id_b}_raw_crf.png")
-    fig.savefig(plot_path, dpi=150)
-    plt.close(fig)
-    print(f"[plot] saved to {plot_path}")
-
-
-def export_best_settings(best_raw_config, best_crf_config, model_name, img_path, img2_path, buffer_m, pixel_size_m):
-    best_settings = {
-        "best_raw_config": best_raw_config,
-        "best_crf_config": best_crf_config,
-        "model_name": model_name,
-        "img_a": img_path,
-        "img_b": img2_path,
-        "buffer_m": buffer_m,
-        "pixel_size_m": pixel_size_m,
-    }
-    os.makedirs(os.path.dirname(cfg.BEST_SETTINGS_PATH), exist_ok=True)
-    with open(cfg.BEST_SETTINGS_PATH, "w", encoding="utf-8") as f:
-        def _write_yaml(d, indent=0):
-            for k, v in d.items():
-                if isinstance(v, dict):
-                    f.write("  " * indent + f"{k}:\n")
-                    _write_yaml(v, indent + 1)
-                else:
-                    f.write("  " * indent + f"{k}: {v}\n")
-        _write_yaml(best_settings)
-    print(f"[config] best settings written to {cfg.BEST_SETTINGS_PATH}")
 
 
 def main():

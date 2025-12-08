@@ -1,3 +1,5 @@
+import time
+
 import numpy as np
 import torch
 from timing_utils import time_start, time_end, DEBUG_TIMING, DEBUG_TIMING_VERBOSE
