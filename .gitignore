@@ -3,8 +3,8 @@
 .idea/
 *.iml
 .vscode/
-.tif
-.npy
+*.tif
+*.npy
 experiments/summaries/data/
 # Python artifacts
 __pycache__/
