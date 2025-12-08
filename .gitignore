@@ -5,6 +5,7 @@
 .vscode/
 *.tif
 *.npy
+*.aux.xml
 experiments/summaries/data/
 # Python artifacts
 __pycache__/
