@@ -116,8 +116,14 @@ def main():
         buffer_pixels   # radius in pixel units for dilation
     )
 
+    if getattr(cfg, "CLIP_GT_TO_BUFFER", False):
+        gt_mask_eval = np.logical_and(gt_mask_B, sh_buffer_mask_B)
+        print(f"[info] CLIP_GT_TO_BUFFER enabled: GT positives -> {gt_mask_eval.sum()} (was {gt_mask_B.sum()})")
+    else:
+        gt_mask_eval = gt_mask_B
+
     _ = compute_oracle_upper_bound(
-        gt_mask_B,      # GT mask on B
+        gt_mask_eval,      # GT mask on B (possibly clipped)
         sh_buffer_mask_B  # SH buffer region (max allowed FG region)
     )
 
@@ -183,7 +189,7 @@ def main():
         feature_dir,           # directory for B/features
         image_id_b,            # B tile cache ID
         sh_buffer_mask_B,      # spatial prior mask
-        gt_mask_B,             # ground-truth for scoring
+        gt_mask_eval,          # ground-truth for scoring
         prefetched_b,          # cached DINO features for B
         USE_FP16_KNN           # use half precision matmul for speed
     )
@@ -195,7 +201,7 @@ def main():
         best_raw_score_full,   # score_map from best k
         best_raw_config["threshold"],  # base threshold to refine
         sh_buffer_mask_B,      # prior mask
-        gt_mask_B              # GT for evaluation
+        gt_mask_eval           # GT for evaluation
     )
 
     # Update configuration if refined solution is better
@@ -222,7 +228,7 @@ def main():
         champion_score_full,         # score map from best raw stage
         thr_center_for_crf,          # CRF unary logistic center
         sh_buffer_mask_B,            # prior mask
-        gt_mask_B,                   # GT mask
+        gt_mask_eval,                # GT mask
         cfg.PROB_SOFTNESS_VALUES,    # CRF unary softness candidates
         cfg.POS_W_VALUES,            # Gaussian pairwise compat weights
         cfg.POS_XY_STD_VALUES,       # Gaussian XY sigma
@@ -252,7 +258,7 @@ def main():
 
         metrics_crf_full = compute_metrics(
             best_crf_mask,      # upsampled CRF mask
-            gt_mask_B           # GT
+            gt_mask_eval        # GT
         )
         print(
             f"[crf-upsampled] IoU={metrics_crf_full['iou']:.3f}, "

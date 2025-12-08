@@ -20,6 +20,7 @@ def build_banks_single_scale(img_a: np.ndarray,
                              feature_dir: str | None = None,
                              image_id: str | None = None,
                              bank_cache_dir: str | None = None):
+    """Build positive/negative banks from Image A labels, with optional caching."""
     t0 = time_start()
 
     if bank_cache_dir is not None and image_id is not None:

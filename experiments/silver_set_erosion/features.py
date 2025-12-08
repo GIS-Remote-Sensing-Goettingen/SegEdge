@@ -9,6 +9,7 @@ from timing_utils import time_start, time_end, DEBUG_TIMING, DEBUG_TIMING_VERBOS
 
 
 def l2_normalize(feats: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    """L2-normalize feature vectors along the last dimension."""
     t0 = time.perf_counter() if DEBUG_TIMING and DEBUG_TIMING_VERBOSE else None
     norms = np.linalg.norm(feats, axis=-1, keepdims=True) + eps
     out = feats / norms
@@ -21,6 +22,7 @@ def tile_iterator(image_hw3: np.ndarray,
                   labels_hw: np.ndarray | None = None,
                   tile_size: int = 1024,
                   stride: int | None = None):
+    """Yield (y,x,img_tile,label_tile) over an image, respecting stride and tile size."""
     h, w = image_hw3.shape[:2]
     if stride is None:
         stride = tile_size
@@ -40,6 +42,7 @@ def tile_iterator(image_hw3: np.ndarray,
 def crop_to_multiple_of_ps(img_tile_hw3: np.ndarray,
                            labels_tile_hw: np.ndarray | None,
                            ps: int):
+    """Crop a tile so height/width are multiples of patch size ps."""
     t0 = time.perf_counter() if DEBUG_TIMING and DEBUG_TIMING_VERBOSE else None
     h, w = img_tile_hw3.shape[:2]
     h_eff = (h // ps) * ps
@@ -55,6 +58,7 @@ def labels_to_patch_masks(labels_tile: np.ndarray,
                           hp: int,
                           wp: int,
                           pos_frac_thresh: float = 0.1):
+    """Convert pixel labels to patch-level pos/neg masks using a fraction threshold."""
     t0 = time.perf_counter() if DEBUG_TIMING and DEBUG_TIMING_VERBOSE else None
     h_eff, w_eff = labels_tile.shape
     patch_h = h_eff // hp
@@ -74,6 +78,7 @@ def tile_feature_path(feature_dir: str,
                       image_id: str,
                       y: int,
                       x: int) -> str:
+    """Canonical path for storing a tile's feature .npy."""
     fname = f"{image_id}_y{y}_x{x}_features.npy"
     return os.path.join(feature_dir, fname)
 
@@ -83,6 +88,7 @@ def save_tile_features(feats_tile: np.ndarray,
                        image_id: str,
                        y: int,
                        x: int):
+    """Persist a tile's features to disk."""
     os.makedirs(feature_dir, exist_ok=True)
     fpath = tile_feature_path(feature_dir, image_id, y, x)
     np.save(fpath, feats_tile.astype(np.float32))
@@ -94,6 +100,7 @@ def extract_patch_features_single_scale(image_hw3: np.ndarray,
                                         device,
                                         ps: int = 16,
                                         aggregate_layers=None):
+    """Extract single-scale DINO patch features (Hp×Wp×C) from an RGB image."""
     t0 = time_start()
     inputs = processor(
         images=image_hw3,
@@ -136,6 +143,7 @@ def prefetch_features_single_scale_image(
     feature_dir: str | None = None,
     image_id: str | None = None,
 ):
+    """Precompute and cache all tile features for an image; return in-memory dict."""
     t0 = time_start()
     cache = {}
     cached_tiles = computed_tiles = skipped_tiles = 0

@@ -14,6 +14,11 @@ BEST_SETTINGS_PATH = "data/plots/best_settings.yml"
 # Model / buffers
 MODEL_NAME = "facebook/dinov3-vitl16-pretrain-sat493m"
 BUFFER_M = 8.0
+TILE_SIZE = 1024
+STRIDE = 512
+PATCH_SIZE = 16  # DINO patch size
+NEG_ALPHA = 1.0  # kNN negative bank weight
+POS_FRAC_THRESH = 0.1  # fraction for positive patch labeling in A
 
 # Grid search
 K_VALUES = [1, 2, 3, 5, 7, 10, 15, 20, 25, 30, 45, 50, 75, 100, 150, 200, 300, 500]
@@ -26,13 +31,20 @@ POS_XY_STD_VALUES = [3.0]
 BILATERAL_W_VALUES = [5.0, 7.0]
 BILATERAL_XY_STD_VALUES = [25.0, 50.0]
 BILATERAL_RGB_STD_VALUES = [3.0, 5.0]
+CRF_NUM_WORKERS = 32
 
 # Shadow filtering (RGB weighted sum) after CRF
 SHADOW_WEIGHT_SETS = [
     (1.0, 1.0, 1.0),
     (0.7, 1.0, 1.0),
     (0.5, 0.8, 1.0),
+    (0.5, 1.0, 0.5),
+    (0.5, 0.5, 1.0),
+    (0.1, 0.5, 0.5),
 ]
 
 # Better initial guesses for 8-bit RGB in [0,255]
-SHADOW_THRESHOLDS = [180, 210, 240, 270, 300, 330, 360, 450 ,500]
+SHADOW_THRESHOLDS = [20,40,60,80,100,120,160,180, 210, 240, 270, 300, 330, 360, 450 ,500]
+
+# Evaluation options
+CLIP_GT_TO_BUFFER = True  # if True, ignore GT outside the SH buffer (max IoU can reach 1.0)
