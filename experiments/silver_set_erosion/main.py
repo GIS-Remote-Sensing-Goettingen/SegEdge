@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: GPL-2.0
 #
 # Single-scale zero-shot transfer from Image A -> Image B using DINOv3.
-# - GPU kNN (torch matmul + top-k)
-# - Use SH_2022 labels to clip predictions on B (+buffer in meters)
-# - Validate vs ground truth shapefile labels_final.shp
-# - Grid search over k and threshold to pick best parameters.
-# - Superpixel refinement (SLIC + mean-score or majority vote) with its own
-#   validation threshold search.
+#
+# Pipeline:
+# - Extract DINOv3 patch features on Image A and B.
+# - Build positive/negative banks from Image A using SH_2022 labels.
+# - GPU kNN classification on Image B (score map + saliency).
+# - Clip predictions on B using a buffered SH_2022 mask.
+# - Grid search over k and threshold to pick best parameters (raw only).
+# - Fine-tune the threshold around the coarse optimum (raw only).
 # - DenseCRF refinement with unary calibrated around the best validation
 #   threshold instead of min-max.
-# - Extended: negative bank scoring (pos - alpha * neg), more timing, oracle
+# - Extended: negative bank scoring (pos - alpha * neg), timing, oracle
 #   upper bound for SH buffer, and CRF hyperparameter grid search.
 
 import time
@@ -24,7 +26,6 @@ import matplotlib.pyplot as plt
 from PIL import Image
 from skimage.transform import resize
 from skimage.morphology import erosion, disk, dilation
-from skimage.segmentation import slic
 
 import rasterio
 from rasterio.plot import reshape_as_image
@@ -61,31 +62,37 @@ THRESHOLD_BATCH_SIZE = 8  # chunk size for GPU threshold evaluation to avoid OOM
 CRF_MAX_CONFIGS = 64  # limit CRF grid to avoid huge runtimes
 THRESHOLD_CPU_BATCH_SIZE = 16  # CPU chunk size for batched threshold eval
 
+# Negative bank config
+MAX_NEG_BANK = 8000      # max number of negative patches (will subsample if larger)
+NEG_ALPHA = 1.0          # score = pos_mean - NEG_ALPHA * neg_mean
+
 
 def time_start():
+    """Start a timing block if DEBUG_TIMING is enabled."""
     if not DEBUG_TIMING:
         return None
     return time.perf_counter()
 
 
 def time_end(label: str, t0):
+    """End a timing block and print elapsed time in seconds."""
     if not DEBUG_TIMING or t0 is None:
         return
     dt = time.perf_counter() - t0
     print(f"[time] {label}: {dt:.3f} s")
 
 
-# Negative bank config
-MAX_NEG_BANK = 8000      # max number of negative patches (will subsample if larger)
-NEG_ALPHA = 1.0          # score = pos_mean - NEG_ALPHA * neg_mean
-
-
 # ----------------------------------------------------------------------
 # 1. model setup
 # ----------------------------------------------------------------------
 
-
 def init_model(model_name: str):
+    """
+    Initialize DINOv3 model and image processor on CPU or GPU.
+
+    We keep this logic separate so that `main` stays cleaner and we can
+    easily swap the backbone by changing only `model_name`.
+    """
     t0 = time_start()
 
     processor = AutoImageProcessor.from_pretrained(model_name)
@@ -104,8 +111,14 @@ def init_model(model_name: str):
 # 2. data loading, reprojection, and basic preparation
 # ----------------------------------------------------------------------
 
-
 def load_dop20_image(path: str) -> np.ndarray:
+    """
+    Load a DOP20 GeoTIFF and return an HxWx3 RGB array.
+
+    We rely on rasterio to read the bands in (C, H, W) and reshape to
+    image layout (H, W, C). If there are more than 3 bands, we keep
+    only the first three (RGB assumption).
+    """
     t0 = time_start()
     with rasterio.open(path) as src:
         arr = src.read()  # (bands, H, W)
@@ -117,6 +130,13 @@ def load_dop20_image(path: str) -> np.ndarray:
 
 
 def reproject_labels_to_image(ref_img_path: str, labels_path: str) -> np.ndarray:
+    """
+    Reproject a raster label map onto the grid of a reference image.
+
+    We create an in-memory raster with the same transform/CRS/resolution as
+    the reference image, reproject the label raster into it with nearest
+    neighbor, and return the first band as a 2D array.
+    """
     t0 = time_start()
     with rasterio.open(ref_img_path) as ref, rasterio.open(labels_path) as src:
         dst_meta = ref.meta.copy()
@@ -210,8 +230,13 @@ def rasterize_vector_labels(vector_path: str,
 # 3. helpers (normalization, tiling, label-to-patch, feature I/O)
 # ----------------------------------------------------------------------
 
-
 def l2_normalize(feats: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    """
+    L2-normalize feature vectors along the last dimension.
+
+    This makes cosine similarity equivalent to dot product, which is
+    what we use for kNN scoring on GPU.
+    """
     t0 = time.perf_counter() if DEBUG_TIMING and DEBUG_TIMING_VERBOSE else None
     norms = np.linalg.norm(feats, axis=-1, keepdims=True) + eps
     out = feats / norms
@@ -224,6 +249,13 @@ def tile_iterator(image_hw3: np.ndarray,
                   labels_hw: np.ndarray | None = None,
                   tile_size: int = 1024,
                   stride: int | None = None):
+    """
+    Generator that yields overlapping tiles (and optionally label tiles)
+    over an HxWx3 image.
+
+    This is used both for DINO feature extraction and for building the
+    positive/negative banks in a memory-friendly way.
+    """
     h, w = image_hw3.shape[:2]
     if stride is None:
         stride = tile_size
@@ -249,6 +281,10 @@ def tile_iterator(image_hw3: np.ndarray,
 def crop_to_multiple_of_ps(img_tile_hw3: np.ndarray,
                            labels_tile_hw: np.ndarray | None,
                            ps: int):
+    """
+    Crop a tile so that both height and width are multiples of the
+    DINO patch size `ps`. This avoids awkward incomplete patches.
+    """
     t0 = time.perf_counter() if DEBUG_TIMING and DEBUG_TIMING_VERBOSE else None
     h, w = img_tile_hw3.shape[:2]
     h_eff = (h // ps) * ps
@@ -269,6 +305,14 @@ def labels_to_patch_masks(labels_tile: np.ndarray,
                           hp: int,
                           wp: int,
                           pos_frac_thresh: float = 0.1):
+    """
+    Aggregate pixel labels into patch-level positive/negative masks.
+
+    - We reshape the label tile into (Hp, patch_h, Wp, patch_w) and compute
+      the foreground fraction within each patch.
+    - A patch is positive if foreground fraction >= pos_frac_thresh.
+    - A patch is negative if there are zero foreground pixels.
+    """
     t0 = time.perf_counter() if DEBUG_TIMING and DEBUG_TIMING_VERBOSE else None
     h_eff, w_eff = labels_tile.shape
     patch_h = h_eff // hp
@@ -292,6 +336,10 @@ def tile_feature_path(feature_dir: str,
                       image_id: str,
                       y: int,
                       x: int) -> str:
+    """
+    Canonical filename for a tile's features. Keeps the naming scheme
+    consistent and easy to grep.
+    """
     fname = f"{image_id}_y{y}_x{x}_features.npy"
     return os.path.join(feature_dir, fname)
 
@@ -301,6 +349,9 @@ def save_tile_features(feats_tile: np.ndarray,
                        image_id: str,
                        y: int,
                        x: int):
+    """
+    Save patch features for a single tile as a .npy file.
+    """
     os.makedirs(feature_dir, exist_ok=True)
     fpath = tile_feature_path(feature_dir, image_id, y, x)
     np.save(fpath, feats_tile.astype(np.float32))
@@ -309,6 +360,13 @@ def save_tile_features(feats_tile: np.ndarray,
 def consolidate_features_for_image(feature_dir: str,
                                    image_id: str,
                                    output_suffix: str = "_features_full.npy"):
+    """
+    Concatenate all per-tile feature arrays for an image into a single
+    (N_patches, C) array and save it.
+
+    This is mostly for downstream analysis/debugging and not required
+    for the pipeline itself.
+    """
     t0 = time_start()
 
     if not os.path.isdir(feature_dir):
@@ -352,13 +410,19 @@ def consolidate_features_for_image(feature_dir: str,
 # 4. single-scale DINOv3 patch feature extraction
 # ----------------------------------------------------------------------
 
-
 def extract_patch_features_single_scale(image_hw3: np.ndarray,
                                         model,
                                         processor,
                                         device,
                                         ps: int = 16,
                                         aggregate_layers=None):
+    """
+    Extract single-scale DINOv3 patch features from an HxWx3 image.
+
+    - We rely on the HuggingFace processor to handle preprocessing.
+    - Optionally average features from multiple layers.
+    - Outputs an (Hp, Wp, C) feature tensor normalized to unit length.
+    """
     t0 = time_start()
     inputs = processor(
         images=image_hw3,
@@ -402,7 +466,6 @@ def extract_patch_features_single_scale(image_hw3: np.ndarray,
 # 5. bank building from Image A (single-scale, with caching)
 # ----------------------------------------------------------------------
 
-
 def build_banks_single_scale(img_a: np.ndarray,
                              labels_a: np.ndarray,
                              model,
@@ -416,6 +479,15 @@ def build_banks_single_scale(img_a: np.ndarray,
                              feature_dir: str | None = None,
                              image_id: str | None = None,
                              bank_cache_dir: str | None = None):
+    """
+    Build positive and negative patch feature banks from Image A.
+
+    - Erode labels to ensure positives are in the interior of SH_2022
+      segments (robustness).
+    - Positive patches: fraction of positive pixels >= pos_frac_thresh.
+    - Negative patches: no positive pixels.
+    - Optionally cache banks on disk to avoid recomputation.
+    """
     t0 = time_start()
 
     # Shortcut: load cached banks if available
@@ -436,6 +508,7 @@ def build_banks_single_scale(img_a: np.ndarray,
     cached_tiles = 0
     computed_tiles = 0
 
+    # Slight erosion to avoid label noise on boundaries
     labels_eroded = erosion((labels_a > 0).astype(bool), disk(2))
 
     for y, x, img_tile, lab_tile in tile_iterator(img_a,
@@ -542,7 +615,6 @@ def build_banks_single_scale(img_a: np.ndarray,
 # 5b. Optional prefetch of Image B features (single-scale, cached features)
 # ----------------------------------------------------------------------
 
-
 def prefetch_features_single_scale_image(
     img_hw3: np.ndarray,
     model,
@@ -558,6 +630,8 @@ def prefetch_features_single_scale_image(
     """
     Preload / compute all tile features for a given image once, so grid-search
     over multiple k values can reuse them without repeatedly hitting disk.
+
+    We store a simple dict keyed by (y, x) with feature arrays and shapes.
     """
     t0 = time_start()
     cache = {}
@@ -623,7 +697,6 @@ def prefetch_features_single_scale_image(
 #     Extended to use negative bank: score = pos_mean - alpha * neg_mean
 # ----------------------------------------------------------------------
 
-
 def zero_shot_knn_single_scale_B_with_saliency(
     img_b: np.ndarray,
     pos_bank: np.ndarray,
@@ -642,6 +715,14 @@ def zero_shot_knn_single_scale_B_with_saliency(
     prefetched_tiles: dict | None = None,
     use_fp16_matmul: bool = False,
 ):
+    """
+    Compute kNN-based zero-shot scores on Image B using DINOv3 features.
+
+    - For each patch feature in B, we compute similarity to the positive
+      and (optionally) negative banks from A.
+    - The score is mean(top-k positive sims) - alpha * mean(top-k negative sims).
+    - We also derive a simple saliency estimate from the positive sims.
+    """
     t0 = time_start()
 
     h_full, w_full = img_b.shape[:2]
@@ -764,10 +845,10 @@ def zero_shot_knn_single_scale_B_with_saliency(
             if DEBUG_TIMING and t_matmul0 is not None:
                 matmul_time += time.perf_counter() - t_matmul0
 
-        # score map for this tile
+        # score map
         score_patch = score_batch.cpu().numpy().reshape(hp, wp)
 
-        # saliency: just use positive sims as before
+        # saliency
         sims_pos = sims_pos_topk.float().cpu().numpy()            # (Nb, k_pos_eff)
         weights = sims_pos / (sims_pos.sum(axis=1, keepdims=True) + 1e-8)
         saliency_vals = (weights * sims_pos).sum(axis=1)
@@ -821,9 +902,14 @@ def zero_shot_knn_single_scale_B_with_saliency(
 # 7. SH_2022 clipping + metrics + oracle upper bound
 # ----------------------------------------------------------------------
 
-
 def build_sh_buffer_mask(labels_sh: np.ndarray,
                          buffer_pixels: int) -> np.ndarray:
+    """
+    Build a binary buffer mask around SH_2022 labels.
+
+    - labels_sh: rasterized SH_2022 map (non-zero = SH).
+    - buffer_pixels: radius in pixels for morphological dilation.
+    """
     t0 = time_start()
     base = labels_sh > 0
     if buffer_pixels <= 0:
@@ -841,6 +927,9 @@ def build_sh_buffer_mask(labels_sh: np.ndarray,
 
 
 def compute_metrics(pred_mask: np.ndarray, gt_mask: np.ndarray) -> dict:
+    """
+    Compute confusion matrix and derived statistics for binary masks.
+    """
     t0 = time.perf_counter() if DEBUG_TIMING and DEBUG_TIMING_VERBOSE else None
     pred = pred_mask.astype(bool)
     gt = gt_mask.astype(bool)
@@ -879,6 +968,9 @@ def compute_metrics_batch_gpu(score_map: np.ndarray,
                               batch_size: int = 8) -> list[dict]:
     """
     Evaluate multiple thresholds in parallel on GPU to speed up grid search.
+
+    We flatten the score and GT arrays and run a batched comparison
+    for a list of thresholds, returning per-threshold metrics.
     """
     t0 = time_start()
     score_t = torch.from_numpy(score_map.astype(np.float32)).to(device).flatten()
@@ -932,7 +1024,8 @@ def compute_metrics_batch_cpu(score_map: np.ndarray,
                               gt_mask: np.ndarray,
                               batch_size: int = 16) -> list[dict]:
     """
-    CPU batched threshold evaluation to reduce Python overhead; chunked to limit RAM.
+    CPU batched threshold evaluation to reduce Python overhead; chunked
+    to limit RAM usage.
     """
     t0 = time_start()
     flat_scores = score_map.astype(np.float32).reshape(1, -1)  # (1, N)
@@ -997,146 +1090,8 @@ def compute_oracle_upper_bound(gt_mask: np.ndarray,
 
 
 # ----------------------------------------------------------------------
-# 8. Superpixel refinement utilities
-# ----------------------------------------------------------------------
-
-
-def compute_slic_superpixels(
-    img_rgb: np.ndarray,
-    n_segments: int = 12000,
-    compactness: float = 10.0,
-    sigma: float = 1.0,
-) -> np.ndarray:
-    """
-    Compute SLIC superpixels once and reuse them.
-
-    Returns:
-        segments: HxW int array with labels in [0, n_sp-1].
-    """
-    h, w, _ = img_rgb.shape
-    img_float = img_rgb.astype(np.float32) / 255.0
-
-    t0 = time_start()
-    segments = slic(
-        img_float,
-        n_segments=n_segments,
-        compactness=compactness,
-        sigma=sigma,
-        start_label=0,
-        channel_axis=-1,
-    )
-    time_end("compute_slic_superpixels", t0)
-
-    assert segments.shape == (h, w)
-    return segments
-
-
-def precompute_superpixel_scores_mean(score_map: np.ndarray,
-                                      segments: np.ndarray) -> np.ndarray:
-    """
-    Precompute superpixel-average scores for mode='mean_score'.
-    """
-    t0 = time_start()
-    h, w = score_map.shape
-    flat_scores = score_map.reshape(-1)
-    flat_segs = segments.reshape(-1)
-    n_sp = int(flat_segs.max()) + 1
-
-    sums = np.bincount(flat_segs, weights=flat_scores, minlength=n_sp)
-    counts = np.bincount(flat_segs, minlength=n_sp)
-    mean_scores = sums / (counts + 1e-8)
-
-    sp_scores_full = mean_scores[flat_segs].reshape(h, w)
-    time_end("precompute_superpixel_scores_mean", t0)
-    return sp_scores_full
-
-
-def refine_with_superpixels(
-    img_rgb: np.ndarray,
-    score_map: np.ndarray,
-    threshold: float,
-    sh_mask: np.ndarray | None = None,
-    segments: np.ndarray | None = None,
-    n_segments: int = 12000,
-    compactness: float = 10.0,
-    sigma: float = 1.0,
-    mode: str = "mean_score",   # "mean_score" or "majority"
-    sp_fg_frac_thresh: float = 0.5,
-) -> np.ndarray:
-    """
-    Superpixel-based refinement for binary segmentation.
-
-    Args
-    ----
-    img_rgb      : HxWx3 uint8/float image (DOP20 tile B).
-    score_map    : HxW float map (kNN score).
-    threshold    : scalar threshold used to binarize scores.
-    sh_mask      : optional HxW bool mask (e.g. SH_2022 buffer).
-                   If given, we clip the final mask with it.
-    segments     : precomputed SLIC labels (HxW). If None, compute here.
-    n_segments   : SLIC number of superpixels (if segments is None).
-    compactness  : SLIC compactness parameter (if segments is None).
-    sigma        : SLIC smoothing parameter (if segments is None).
-    mode         : "mean_score" -> average score per superpixel
-                   "majority"   -> majority vote of (score >= thr)
-    sp_fg_frac_thresh : for "majority" mode, fraction of foreground
-                        pixels in a superpixel needed to mark it FG.
-
-    Returns
-    -------
-    sp_mask      : HxW boolean array (True = foreground).
-    """
-    t0 = time_start()
-    h, w = score_map.shape
-    assert img_rgb.shape[:2] == (h, w), "img_rgb and score_map must match in HxW"
-
-    if segments is None:
-        segments = compute_slic_superpixels(
-            img_rgb,
-            n_segments=n_segments,
-            compactness=compactness,
-            sigma=sigma,
-        )
-    else:
-        assert segments.shape == (h, w)
-
-    flat_scores = score_map.reshape(-1)
-    flat_segs = segments.reshape(-1)
-    n_sp = segments.max() + 1
-
-    if mode == "mean_score":
-        # Mean kNN score per superpixel
-        sums = np.bincount(flat_segs, weights=flat_scores, minlength=n_sp)
-        counts = np.bincount(flat_segs, minlength=n_sp)
-        mean_scores = sums / (counts + 1e-8)
-
-        # Broadcast back to pixel grid
-        sp_scores = mean_scores[flat_segs].reshape(h, w)
-        sp_mask = sp_scores >= threshold
-
-    elif mode == "majority":
-        # Majority vote over hard mask (score >= thr)
-        hard = (flat_scores >= threshold).astype(np.float32)
-        sums = np.bincount(flat_segs, weights=hard, minlength=n_sp)
-        counts = np.bincount(flat_segs, minlength=n_sp)
-        frac_fg = sums / (counts + 1e-8)
-
-        sp_fg = frac_fg >= sp_fg_frac_thresh
-        sp_mask = sp_fg[flat_segs].reshape(h, w)
-    else:
-        raise ValueError(f"Unknown mode for superpixel refinement: {mode}")
-
-    if sh_mask is not None:
-        sp_mask = np.logical_and(sp_mask, sh_mask.astype(bool))
-
-    time_end("refine_with_superpixels", t0)
-    return sp_mask
-
-
-# ----------------------------------------------------------------------
 # 9. DenseCRF refinement (logistic unary centred at threshold)
 # ----------------------------------------------------------------------
-
 
 def refine_with_densecrf(
     img_rgb: np.ndarray,
@@ -1154,21 +1109,11 @@ def refine_with_densecrf(
     """
     DenseCRF refinement for binary segmentation.
 
-    Args
-    ----
-    img_rgb         : HxWx3 uint8 image (DOP20 tile B).
-    score_map       : HxW float map, higher => more "LWF-like" (from kNN).
-    threshold_center: scalar, where logit=0 in logistic(probability) space.
-                      Typically the validation-optimal threshold (thr_best).
-    sh_mask         : optional HxW boolean mask. If given, we strongly
-                      discourage foreground outside this mask.
-    prob_softness   : controls steepness of logistic. Smaller => sharper.
-    n_iters         : mean-field iterations in DenseCRF.
-    *_w, *_std      : pairwise term hyperparams.
-
-    Returns
-    -------
-    refined_mask : HxW boolean array (True = foreground).
+    - We convert the score_map to a foreground probability via a logistic
+      centered at `threshold_center`.
+    - SH_2022 buffer is encoded by down-weighting foreground outside.
+    - CRF pairwise terms encourage spatial smoothness and color-aligned
+      boundaries, improving coherence along LWFs.
     """
     t0 = time_start()
     h, w, _ = img_rgb.shape
@@ -1246,7 +1191,8 @@ def refine_with_densecrf(
 def _crf_eval_worker(args):
     """
     Helper for process-based CRF evaluation to leverage multiple CPU cores.
-    Returns metrics and the config; mask is recomputed for the best config later.
+    Returns metrics and the config; mask is recomputed for the best config
+    later at full resolution.
     """
     (img_rgb_ds,
      score_map_ds,
@@ -1258,10 +1204,10 @@ def _crf_eval_worker(args):
 
     prob_soft, pos_w, pos_xy, bi_w, bi_xy, bi_rgb = cfg
     mask_crf_local = refine_with_densecrf(
-        img_rgb=img_rgb_ds,
-        score_map=score_map_ds,
-        threshold_center=threshold_center,
-        sh_mask=sh_mask_ds,
+        img_rgb_ds,
+        score_map_ds,
+        threshold_center,
+        sh_mask_ds,
         prob_softness=prob_soft,
         n_iters=n_iters,
         pos_w=pos_w,
@@ -1303,12 +1249,14 @@ def crf_grid_search(
     """
     Small grid search over CRF hyperparameters for a fixed (k, thr)
     champion configuration.
+
+    We optionally downsample data for a coarse search and then recompute
+    the best configuration on the same resolution.
     """
     t0 = time_start()
     best_cfg = None
     best_mask = None
     best_iou = -1.0
-    cfg_counter = 0
 
     if downsample_factor > 1:
         # Coarse search on downsampled data for speed
@@ -1445,29 +1393,33 @@ def crf_grid_search(
 
 
 # ----------------------------------------------------------------------
-# 10. Grid search over k and threshold
-#     (raw + optional superpixel refinement)
-#     + optional fine threshold tuning around the best config
+# 10. Grid search over k and threshold (raw only)
+#     + fine threshold tuning (raw only)
 # ----------------------------------------------------------------------
-
 
 def fine_tune_threshold(
     score_map: np.ndarray,
     base_threshold: float,
     sh_mask: np.ndarray | None,
     gt_mask: np.ndarray,
-    img_rgb: np.ndarray | None = None,
     step: float = 0.01,
     window: float = 0.08,
-    use_superpixels: bool = False,
-    sp_params: dict | None = None,
 ):
     """
-    Small 1D sweep around the coarse grid-search optimum to squeeze extra IoU.
+    Fine-tune a scalar threshold around a coarse optimum using only the raw
+    score map (no superpixels).
+
+    - Search in [base_threshold - window, base_threshold + window], clamped
+      to [0, 1].
+    - Clip predictions by SH_2022 buffer if provided.
+    - Keep the threshold that maximizes IoU on gt_mask.
     """
     t0 = time_start()
+
+    # Clamp search interval to the valid score range [0, 1]
     thr_min = max(0.0, base_threshold - window)
     thr_max = min(1.0, base_threshold + window)
+
     thr_vals = np.arange(thr_min, thr_max + 1e-8, step)
 
     best_thr = base_threshold
@@ -1475,34 +1427,17 @@ def fine_tune_threshold(
     best_mask = None
     best_iou = -1.0
 
-    sp_scores = None
-    if use_superpixels and sp_params is not None:
-        if sp_params.get("mode", "mean_score") == "mean_score":
-            segments = sp_params.get("segments", None)
-            if segments is not None:
-                sp_scores = precompute_superpixel_scores_mean(score_map, segments)
-
     for thr in thr_vals:
-        if use_superpixels:
-            if sp_scores is not None:
-                mask = sp_scores >= thr
-                if sh_mask is not None:
-                    mask = np.logical_and(mask, sh_mask)
-            else:
-                assert img_rgb is not None, "img_rgb is required for superpixel tuning"
-                mask = refine_with_superpixels(
-                    img_rgb=img_rgb,
-                    score_map=score_map,
-                    threshold=thr,
-                    sh_mask=sh_mask,
-                    **(sp_params or {}),
-                )
-        else:
-            mask = score_map >= thr
-            if sh_mask is not None:
-                mask = np.logical_and(mask, sh_mask)
+        # Simple per-pixel thresholding
+        mask = score_map >= thr
 
+        # Enforce SH_2022 buffer if given
+        if sh_mask is not None:
+            mask = np.logical_and(mask, sh_mask)
+
+        # Evaluate IoU/F1 etc.
         metrics = compute_metrics(mask, gt_mask)
+
         if metrics["iou"] > best_iou:
             best_iou = metrics["iou"]
             best_thr = thr
@@ -1510,9 +1445,11 @@ def fine_tune_threshold(
             best_mask = mask
 
     print(
-        f"[tune-thr] base={base_threshold:.3f} -> best={best_thr:.3f} "
-        f"IoU={best_metrics['iou']:.3f}, F1={best_metrics['f1']:.3f}"
+        f"[tune-thr] base={base_threshold:.3f} -> "
+        f"best={best_thr:.3f} IoU={best_metrics['iou']:.3f}, "
+        f"F1={best_metrics['f1']:.3f}"
     )
+
     time_end("fine_tune_threshold", t0)
     return best_thr, best_metrics, best_mask
 
@@ -1533,34 +1470,27 @@ def grid_search_k_threshold(
     image_id_b: str,
     sh_buffer_mask_b: np.ndarray,
     gt_mask_b: np.ndarray,
-    use_superpixels: bool = False,
-    sp_params: dict | None = None,
     prefetched_tiles_b: dict | None = None,
     use_fp16_matmul: bool = False,
 ):
     """
-    Grid search over (k, threshold).
+    Grid search over (k, threshold) using only raw per-pixel kNN scores.
 
-    Returns:
-        best_raw_config, best_raw_score_full, best_raw_saliency_full,
-        best_sp_config,  best_sp_score_full
+    - For each k, compute a score map and evaluate many thresholds.
+    - SH_2022 buffer is used to clip predictions for each threshold.
+    - The best configuration is chosen by IoU on Image B.
     """
     t0 = time_start()
-
-    if sp_params is None:
-        sp_params = {}
 
     best_raw_config = None
     best_raw_score_full = None
     best_raw_saliency_full = None
     best_raw_iou = -1.0
 
-    best_sp_config = None
-    best_sp_score_full = None
-    best_sp_iou = -1.0
-
     for k in k_values:
         t0_k_total = time_start()
+
+        # 1) Compute raw kNN scores for this k
         t0_k_score = time_start()
         score_full, saliency_full = zero_shot_knn_single_scale_B_with_saliency(
             img_b=img_b,
@@ -1582,14 +1512,9 @@ def grid_search_k_threshold(
         )
         time_end(f"grid_search_score_full(k={k})", t0_k_score)
 
-        # Precompute SP scores once per k if using mean-score SP mode
-        sp_scores_full = None
-        if use_superpixels and sp_params.get("mode", "mean_score") == "mean_score":
-            segments = sp_params.get("segments", None)
-            if segments is not None:
-                sp_scores_full = precompute_superpixel_scores_mean(score_full, segments)
+        # 2) Evaluate multiple thresholds in batch
+        metrics_raw_list = None
 
-        # ----- raw per-pixel thresholds in batch (GPU if available) -----
         if USE_GPU_THRESHOLD_METRICS and device.type == "cuda":
             try:
                 metrics_raw_list = compute_metrics_batch_gpu(
@@ -1604,6 +1529,7 @@ def grid_search_k_threshold(
                 torch.cuda.empty_cache()
                 metrics_raw_list = None
                 print("[warn] OOM during GPU threshold metrics; falling back to CPU")
+
         if metrics_raw_list is None:
             metrics_raw_list = compute_metrics_batch_cpu(
                 score_map=score_full,
@@ -1613,6 +1539,7 @@ def grid_search_k_threshold(
                 batch_size=THRESHOLD_CPU_BATCH_SIZE,
             )
 
+        # 3) Track best (k, thr) based on IoU
         for metrics_raw in metrics_raw_list:
             thr = metrics_raw["threshold"]
             iou_raw = metrics_raw["iou"]
@@ -1636,96 +1563,30 @@ def grid_search_k_threshold(
                 best_raw_score_full = score_full.copy()
                 best_raw_saliency_full = saliency_full.copy()
 
-        # ----- superpixel thresholds (still per-thr; could be batch if mean-score precomputed) -----
-        if use_superpixels:
-            if sp_scores_full is not None:
-                metrics_sp_list = compute_metrics_batch_cpu(
-                    score_map=sp_scores_full,
-                    thresholds=thresholds,
-                    sh_mask=sh_buffer_mask_b,
-                    gt_mask=gt_mask_b,
-                    batch_size=THRESHOLD_CPU_BATCH_SIZE,
-                )
-                for metrics_sp in metrics_sp_list:
-                    thr = metrics_sp["threshold"]
-                    iou_sp = metrics_sp["iou"]
-                    f1_sp = metrics_sp["f1"]
-                    print(
-                        f"[eval-SP]  k={k}, thr={thr:.3f} -> "
-                        f"IoU={iou_sp:.3f}, F1={f1_sp:.3f}, "
-                        f"P={metrics_sp['precision']:.3f}, "
-                        f"R={metrics_sp['recall']:.3f}"
-                    )
-                    if iou_sp > best_sp_iou:
-                        best_sp_iou = iou_sp
-                        best_sp_config = {
-                            "k": k,
-                            "threshold": thr,
-                            "source": "superpixels",
-                            **metrics_sp,
-                        }
-                        best_sp_score_full = score_full.copy()
-            else:
-                for thr in thresholds:
-                    t_thr_sp = time_start()
-                    mask_sp = refine_with_superpixels(
-                        img_rgb=img_b,
-                        score_map=score_full,
-                        threshold=thr,
-                        sh_mask=sh_buffer_mask_b,
-                        **sp_params,
-                    )
-
-                    metrics_sp = compute_metrics(mask_sp, gt_mask_b)
-                    iou_sp = metrics_sp["iou"]
-                    f1_sp = metrics_sp["f1"]
-
-                    print(
-                        f"[eval-SP]  k={k}, thr={thr:.3f} -> "
-                        f"IoU={iou_sp:.3f}, F1={f1_sp:.3f}, "
-                        f"P={metrics_sp['precision']:.3f}, "
-                        f"R={metrics_sp['recall']:.3f}"
-                    )
-                    time_end(f"threshold_SP(k={k},thr={thr:.3f})", t_thr_sp)
-
-                    if iou_sp > best_sp_iou:
-                        best_sp_iou = iou_sp
-                        best_sp_config = {
-                            "k": k,
-                            "threshold": thr,
-                            "source": "superpixels",
-                            **metrics_sp,
-                        }
-                        best_sp_score_full = score_full.copy()
-
         time_end(f"k_loop_total(k={k})", t0_k_total)
 
     print("\n[best-raw] configuration:")
     print(best_raw_config)
 
-    if best_sp_config is not None:
-        print("\n[best-SP] configuration:")
-        print(best_sp_config)
-
     time_end("grid_search_k_threshold", t0)
 
-    return (
-        best_raw_config,
-        best_raw_score_full,
-        best_raw_saliency_full,
-        best_sp_config,
-        best_sp_score_full,
-    )
+    return best_raw_config, best_raw_score_full, best_raw_saliency_full
 
 
 # ----------------------------------------------------------------------
 # 11. shapefile export
 # ----------------------------------------------------------------------
 
-
 def export_mask_to_shapefile(mask: np.ndarray,
                              ref_raster_path: str,
                              out_path: str):
+    """
+    Export a binary mask as a polygon shapefile in the CRS of the
+    reference raster.
+
+    - We use rasterio.features.shapes to vectorize the mask.
+    - Only pixels with value 1 are exported.
+    """
     t0 = time_start()
 
     mask_uint8 = mask.astype("uint8")
@@ -1774,8 +1635,17 @@ def export_mask_to_shapefile(mask: np.ndarray,
 # 12. script entry point
 # ----------------------------------------------------------------------
 
-
 def main():
+    """
+    End-to-end orchestration for single-scale DINOv3 zero-shot transfer:
+
+    - Load images and labels.
+    - Build feature banks on Image A.
+    - Run kNN on Image B with a grid over k and thresholds.
+    - Fine-tune threshold around the best coarse optimum (raw only).
+    - Run CRF grid search around the champion config.
+    - Visualize results and export shapefiles for raw-best and CRF-best.
+    """
     t0_main = time_start()
 
     model_name = "facebook/dinov3-vitl16-pretrain-sat493m"
@@ -1783,23 +1653,16 @@ def main():
 
     # ------------ paths ------------
     img_path = (
-        "/home/mak/PycharmProjects/SegEdge/experiments/"
-        "get_data_from_api/patches_mt/"
-        "dop20_593000_5979000_1km_20cm.tif"
+        "data/dop20_593000_5979000_1km_20cm.tif"
     )  # Image A
     img2_path = (
-        "/home/mak/PycharmProjects/SegEdge/experiments/"
-        "get_data_from_api/patches_mt/"
-        "dop20_592000_5982000_1km_20cm.tif"
+        "data/dop20_592000_5982000_1km_20cm.tif"
     )  # Image B
     lab_path = (
-        "/mnt/nvme1n1p5/SH_dataset/"
-        "planet_labels_2022.tif"
+        "data/planet_labels_2022.tif"
     )  # SH_2022 raster
     gt_vector_path = (
-        "/home/mak/PycharmProjects/SegEdge/experiments/"
-        "get_data_from_api/patches_mt/"
-        "labels_final.shp"
+        "data/labels_final.shp"
     )  # ground truth for 592000 tile
 
     # ------------ data loading A/B ------------
@@ -1862,11 +1725,6 @@ def main():
     # ------------ oracle upper bound (only inside SH buffer allowed) ------------
     _ = compute_oracle_upper_bound(gt_mask_B, sh_buffer_mask_B)
 
-    # ------------ precompute SLIC superpixels for B ------------
-    # Superpixels disabled (not helpful in this run)
-    sp_segments = None
-    sp_params = {}
-
     # ------------ prefetch Image B features once for all k ------------
     prefetched_b = prefetch_features_single_scale_image(
         img_hw3=img_b,
@@ -1881,17 +1739,11 @@ def main():
         image_id=image_id_b,
     )
 
-    # ------------ grid search on B (raw + superpixels) ------------
-    K_VALUES = [1, 2, 3, 5, 7, 10, 15, 20, 25, 30, 45, 50, 75, 100, 150, 200 ,300 , 500 ]
+    # ------------ grid search on B (raw only) ------------
+    K_VALUES = [1, 2, 3, 5, 7, 10, 15, 20, 25, 30, 45, 50, 75, 100, 150, 200, 300, 500]
     THRESHOLDS = np.linspace(0.01, 0.9, 50).tolist()
 
-    (
-        best_raw_config,
-        best_raw_score_full,
-        best_raw_saliency_full,
-        best_sp_config,
-        best_sp_score_full,
-    ) = grid_search_k_threshold(
+    best_raw_config, best_raw_score_full, best_raw_saliency_full = grid_search_k_threshold(
         img_b=img_b,
         pos_bank=pos_bank,
         neg_bank=neg_bank,
@@ -1907,21 +1759,19 @@ def main():
         image_id_b=image_id_b,
         sh_buffer_mask_b=sh_buffer_mask_B,
         gt_mask_b=gt_mask_B,
-        use_superpixels=False,
-        sp_params=sp_params,
         prefetched_tiles_b=prefetched_b,
         use_fp16_matmul=USE_FP16_KNN,
     )
 
-    # ------------ fine-tune thresholds around coarse optimum ------------
+    # ------------ fine-tune threshold around coarse optimum (raw only) ------------
     thr_best_raw_refined, metrics_raw_refined, mask_raw_best = fine_tune_threshold(
         score_map=best_raw_score_full,
         base_threshold=best_raw_config["threshold"],
         sh_mask=sh_buffer_mask_B,
         gt_mask=gt_mask_B,
-        img_rgb=img_b,
-        use_superpixels=False,
     )
+
+    # Update config if refinement improved IoU
     if metrics_raw_refined["iou"] >= best_raw_config["iou"]:
         best_raw_config = {
             **best_raw_config,
@@ -1929,37 +1779,11 @@ def main():
             **metrics_raw_refined,
         }
     else:
+        # Use the coarse threshold if refinement did not help
         mask_raw_best = best_raw_score_full >= best_raw_config["threshold"]
         mask_raw_best = np.logical_and(mask_raw_best, sh_buffer_mask_B)
 
-    if best_sp_config is not None:
-        thr_best_sp_refined, metrics_sp_refined, mask_sp_best = fine_tune_threshold(
-            score_map=best_sp_score_full,
-            base_threshold=best_sp_config["threshold"],
-            sh_mask=sh_buffer_mask_B,
-            gt_mask=gt_mask_B,
-            img_rgb=img_b,
-            use_superpixels=True,
-            sp_params=sp_params,
-        )
-        if metrics_sp_refined["iou"] >= best_sp_config["iou"]:
-            best_sp_config = {
-                **best_sp_config,
-                "threshold": thr_best_sp_refined,
-                **metrics_sp_refined,
-            }
-        else:
-            mask_sp_best = refine_with_superpixels(
-                img_rgb=img_b,
-                score_map=best_sp_score_full,
-                threshold=best_sp_config["threshold"],
-                sh_mask=sh_buffer_mask_B,
-                **sp_params,
-            )
-    else:
-        mask_sp_best = None
-
-    # ------------ choose champion (raw vs SP) for CRF calibration ------------
+    # ------------ choose champion (raw) for CRF calibration ------------
     champion_config = best_raw_config
     champion_score_full = best_raw_score_full
 
@@ -2025,22 +1849,19 @@ def main():
             f"R={metrics_crf_full['recall']:.3f}"
         )
 
-    # ------------ visualization: raw vs SP vs CRF ------------
-    fig, axs = plt.subplots(2, 3, figsize=(24, 12))
+    # ------------ visualization: raw vs CRF ------------
+    fig, axs = plt.subplots(2, 2, figsize=(16, 12))
 
+    # Row 0: inputs
     axs[0, 0].imshow(img_b)
     axs[0, 0].set_title("Image B (RGB)")
     axs[0, 0].axis("off")
 
-    axs[0, 1].imshow(labels_SH_B > 0, cmap="gray")
-    axs[0, 1].set_title("SH_2022 raster (B)")
+    axs[0, 1].imshow(gt_mask_B > 0, cmap="gray")
+    axs[0, 1].set_title("Ground truth (labels_final)")
     axs[0, 1].axis("off")
 
-    axs[0, 2].imshow(gt_mask_B > 0, cmap="gray")
-    axs[0, 2].set_title("Ground truth (labels_final)")
-    axs[0, 2].axis("off")
-
-    # Best raw kNN + threshold + buffer
+    # Row 1: raw best vs CRF best
     overlay_raw = img_b.copy()
     overlay_mask_raw = mask_raw_best
     overlay_raw[overlay_mask_raw] = (
@@ -2053,36 +1874,17 @@ def main():
     )
     axs[1, 0].axis("off")
 
-    # Best superpixel-refined mask
-    if mask_sp_best is not None:
-        overlay_sp = img_b.copy()
-        overlay_mask_sp = mask_sp_best
-        overlay_sp[overlay_mask_sp] = (
-            0.5 * overlay_sp[overlay_mask_sp] + 0.5 * np.array([0, 0, 255])
-        ).astype(overlay_sp.dtype)
-
-        axs[1, 1].imshow(overlay_sp)
-        axs[1, 1].set_title(
-            f"Superpixels (k={best_sp_config['k']}, thr={best_sp_config['threshold']:.3f})\n"
-            f"IoU={best_sp_config['iou']:.3f}, F1={best_sp_config['f1']:.3f}"
-        )
-    else:
-        axs[1, 1].imshow(img_b)
-        axs[1, 1].set_title("Superpixels: disabled / no best config")
-    axs[1, 1].axis("off")
-
-    # Best CRF-refined mask
     overlay_crf = img_b.copy()
     overlay_mask_crf = best_crf_mask
     overlay_crf[overlay_mask_crf] = (
         0.5 * overlay_crf[overlay_mask_crf] + 0.5 * np.array([255, 0, 0])
     ).astype(overlay_crf.dtype)
-    axs[1, 2].imshow(overlay_crf)
-    axs[1, 2].set_title(
+    axs[1, 1].imshow(overlay_crf)
+    axs[1, 1].set_title(
         f"CRF (k={best_crf_config['k']}, center_thr={thr_center_for_crf:.3f})\n"
         f"IoU={best_crf_config['iou']:.3f}, F1={best_crf_config['f1']:.3f}"
     )
-    axs[1, 2].axis("off")
+    axs[1, 1].axis("off")
 
     plt.tight_layout()
     plt.show()
@@ -2098,15 +1900,6 @@ def main():
         ref_raster_path=img2_path,
         out_path=shp_path_raw,
     )
-
-    # Superpixel best
-    if mask_sp_best is not None:
-        shp_path_sp = os.path.join(out_dir_b, f"{base_name_b}_pred_mask_best_sp.shp")
-        export_mask_to_shapefile(
-            mask=mask_sp_best,
-            ref_raster_path=img2_path,
-            out_path=shp_path_sp,
-        )
 
     # CRF best
     shp_path_crf = os.path.join(out_dir_b, f"{base_name_b}_pred_mask_best_crf.shp")
@@ -2126,8 +1919,6 @@ def main():
         "best_raw_config": best_raw_config,
         "best_raw_score_full": best_raw_score_full,
         "best_raw_saliency_full": best_raw_saliency_full,
-        "best_sp_config": best_sp_config,
-        "best_sp_score_full": best_sp_score_full,
         "best_crf_config": best_crf_config,
         "best_crf_score_full": champion_score_full,
     }
