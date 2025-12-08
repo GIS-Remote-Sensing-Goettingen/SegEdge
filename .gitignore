@@ -14,6 +14,11 @@
 *.prj
 *.log
 *.qdz
+*.pth
+*.qgz
+*.ckpt
+*.pth.tar
+*.qmd
 experiments/summaries/data/
 # Python artifacts
 __pycache__/
