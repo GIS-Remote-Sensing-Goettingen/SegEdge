@@ -321,10 +321,10 @@ def main():
     model_name = "facebook/dinov3-vitl16-pretrain-sat493m"
     dino_model, processor, device = init_model(model_name)
 
-    img_path = "/home/mak/PycharmProjects/SegEdge/experiments/get_data_from_api/patches_mt/dop20_593000_5979000_1km_20cm.tif"
-    img2_path = "/home/mak/PycharmProjects/SegEdge/experiments/get_data_from_api/patches_mt/dop20_592000_5982000_1km_20cm.tif"
+    img_path = "/experiments/get_data_from_api/patches_mt/dop20_593000_5979000_1km_20cm.tif"
+    img2_path = "/experiments/get_data_from_api/patches_mt/dop20_592000_5982000_1km_20cm.tif"
     lab_path = "/mnt/nvme1n1p5/SH_dataset/planet_labels_2022.tif"
-    gt_vector_path = "/home/mak/PycharmProjects/SegEdge/experiments/get_data_from_api/patches_mt/labels_final.shp"
+    gt_vector_path = "/experiments/get_data_from_api/patches_mt/labels_final.shp"
 
     t0_data = time_start()
     img = load_dop20_image(img_path)

@@ -23,6 +23,7 @@ from metrics_utils import compute_oracle_upper_bound, compute_metrics
 from crf_utils import crf_grid_search
 from plotting import save_plot
 from transformers import AutoImageProcessor, AutoModel
+from shadow_filter import shadow_filter_grid
 
 
 # Config-driven flags
@@ -272,14 +273,25 @@ def main():
             f"P={metrics_crf_full['precision']:.3f}, R={metrics_crf_full['recall']:.3f}"
         )
 
+    # Shadow filtering
+    shadow_cfg, shadow_mask = shadow_filter_grid(
+        img_rgb=img_b,
+        base_mask=best_crf_mask,
+        gt_mask=gt_mask_B,
+        weight_sets=getattr(cfg, "SHADOW_WEIGHT_SETS", [(1.0, 1.0, 1.0)]),
+        thresholds=getattr(cfg, "SHADOW_THRESHOLDS", [100]),
+    )
+    shadow_best = {"cfg": shadow_cfg, "mask": shadow_mask}
+
     # Plot
-    save_plot(img_b, gt_mask_B, mask_raw_best, best_raw_config, best_crf_mask, best_crf_config, thr_center_for_crf, cfg.PLOT_DIR, image_id_b)
+    save_plot(img_b, gt_mask_B, mask_raw_best, best_raw_config, best_crf_mask, best_crf_config, thr_center_for_crf, cfg.PLOT_DIR, image_id_b, best_shadow=shadow_best)
 
     # Shapefiles
     base_name_b = os.path.splitext(os.path.basename(img2_path))[0]
     out_dir_b = os.path.dirname(img2_path)
     export_mask_to_shapefile(mask_raw_best, img2_path, os.path.join(out_dir_b, f"{base_name_b}_pred_mask_best_raw.shp"))
     export_mask_to_shapefile(best_crf_mask, img2_path, os.path.join(out_dir_b, f"{base_name_b}_pred_mask_best_crf.shp"))
+    export_mask_to_shapefile(shadow_mask, img2_path, os.path.join(out_dir_b, f"{base_name_b}_pred_mask_best_shadow.shp"))
 
     # Consolidate features
     consolidate_features_for_image(feature_dir, image_id_a)

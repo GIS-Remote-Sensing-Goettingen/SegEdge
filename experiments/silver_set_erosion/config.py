@@ -26,3 +26,11 @@ POS_XY_STD_VALUES = [3.0]
 BILATERAL_W_VALUES = [5.0, 7.0]
 BILATERAL_XY_STD_VALUES = [25.0, 50.0]
 BILATERAL_RGB_STD_VALUES = [3.0, 5.0]
+
+# Shadow filtering (RGB weighted sum) after CRF
+SHADOW_WEIGHT_SETS = [
+    (1.0, 1.0, 1.0),
+    (0.7, 1.0, 1.0),
+    (0.5, 0.8, 1.0),
+]
+SHADOW_THRESHOLDS = [50, 75, 100, 125, 150, 175]
