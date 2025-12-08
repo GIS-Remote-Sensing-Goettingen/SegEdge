@@ -184,6 +184,10 @@ def shadow_filter_grid(img_rgb: np.ndarray,
                     best_cfg_global = cfg
                     best_mask_global = mask
 
+    #print stats
+    print(f"[info] shadow_filter_grid: best config: {best_cfg_global}")
+    print(f"[info] best IOU after shadow filtering:{compute_metrics(best_mask_global.astype(np.uint8), gt_mask_bool.astype(np.uint8))['iou']:.4f}")
+
     time_end("shadow_filter_grid", t0)
     return best_cfg_global, best_mask_global
 
