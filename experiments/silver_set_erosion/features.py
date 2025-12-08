@@ -22,7 +22,7 @@ def tile_iterator(image_hw3: np.ndarray,
                   labels_hw: np.ndarray | None = None,
                   tile_size: int = 1024,
                   stride: int | None = None):
-    """Yield (y,x,img_tile,label_tile) over an image, respecting stride and tile size."""
+    """Yield (y,x,img_tile,label_tile) windows over an image with overlap (stride defaults to tile_size)."""
     h, w = image_hw3.shape[:2]
     if stride is None:
         stride = tile_size
@@ -143,7 +143,7 @@ def prefetch_features_single_scale_image(
     feature_dir: str | None = None,
     image_id: str | None = None,
 ):
-    """Precompute and cache all tile features for an image; return in-memory dict."""
+    """Precompute and cache all tile features for an image; returns dict keyed by (y,x) with feats/shape."""
     t0 = time_start()
     cache = {}
     cached_tiles = computed_tiles = skipped_tiles = 0

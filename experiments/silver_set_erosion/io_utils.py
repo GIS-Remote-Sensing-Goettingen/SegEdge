@@ -22,6 +22,7 @@ except ImportError:
 
 
 def load_dop20_image(path: str) -> np.ndarray:
+    """Load a GeoTIFF orthophoto and return an HxWx3 RGB array (clips to first 3 bands)."""
     t0 = time_start()
     with rasterio.open(path) as src:
         arr = src.read()
@@ -33,6 +34,7 @@ def load_dop20_image(path: str) -> np.ndarray:
 
 
 def reproject_labels_to_image(ref_img_path: str, labels_path: str) -> np.ndarray:
+    """Reproject a raster label map onto the grid/CRS of a reference image using nearest neighbor."""
     t0 = time_start()
     with rasterio.open(ref_img_path) as ref, rasterio.open(labels_path) as src:
         dst_meta = ref.meta.copy()
@@ -60,6 +62,7 @@ def reproject_labels_to_image(ref_img_path: str, labels_path: str) -> np.ndarray
 def rasterize_vector_labels(vector_path: str,
                             ref_raster_path: str,
                             burn_value: int = 1) -> np.ndarray:
+    """Rasterize a vector layer onto the reference raster grid; auto-reprojects if CRS differs."""
     t0 = time_start()
     with rasterio.open(ref_raster_path) as src:
         out_shape = (src.height, src.width)
@@ -95,6 +98,7 @@ def rasterize_vector_labels(vector_path: str,
 
 
 def build_sh_buffer_mask(labels_sh: np.ndarray, buffer_pixels: int) -> np.ndarray:
+    """Dilate SH_2022 raster by buffer_pixels using cv2 (fast) or skimage fallback."""
     t0 = time_start()
     base = labels_sh > 0
     if buffer_pixels <= 0:
@@ -111,6 +115,7 @@ def build_sh_buffer_mask(labels_sh: np.ndarray, buffer_pixels: int) -> np.ndarra
 
 
 def export_mask_to_shapefile(mask: np.ndarray, ref_raster_path: str, out_path: str):
+    """Vectorize a binary mask and save polygons to a shapefile aligned to ref_raster_path CRS."""
     t0 = time_start()
     mask_uint8 = mask.astype("uint8")
     with rasterio.open(ref_raster_path) as src:
@@ -131,6 +136,7 @@ def export_mask_to_shapefile(mask: np.ndarray, ref_raster_path: str, out_path: s
 
 
 def consolidate_features_for_image(feature_dir: str, image_id: str, output_suffix: str = "_features_full.npy"):
+    """Concatenate all tile feature .npy files for an image into a single array; return path."""
     t0 = time_start()
     if not os.path.isdir(feature_dir):
         print(f"[warn] feature_dir does not exist: {feature_dir}")
@@ -155,16 +161,30 @@ def consolidate_features_for_image(feature_dir: str, image_id: str, output_suffi
     return out_path
 
 
-def export_best_settings(best_raw_config, best_crf_config, model_name, img_path, img2_path, buffer_m, pixel_size_m):
+def export_best_settings(best_raw_config,
+                         best_crf_config,
+                         model_name,
+                         img_path,
+                         img2_path,
+                         buffer_m,
+                         pixel_size_m,
+                         shadow_cfg=None,
+                         extra_settings: dict | None = None):
+    """
+    Write a minimal YAML with the champion configurations and context (paths, buffer, pixel size).
+    """
     best_settings = {
         "best_raw_config": best_raw_config,
         "best_crf_config": best_crf_config,
+        "best_shadow_config": shadow_cfg,
         "model_name": model_name,
         "img_a": img_path,
         "img_b": img2_path,
         "buffer_m": buffer_m,
         "pixel_size_m": pixel_size_m,
     }
+    if extra_settings:
+        best_settings["extra"] = extra_settings
     os.makedirs(os.path.dirname(cfg.BEST_SETTINGS_PATH), exist_ok=True)
     with open(cfg.BEST_SETTINGS_PATH, "w", encoding="utf-8") as f:
         def _write_yaml(d, indent=0):

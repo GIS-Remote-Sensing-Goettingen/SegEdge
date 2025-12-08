@@ -22,6 +22,7 @@ def refine_with_densecrf(
     bilateral_xy_std: float = 50.0,
     bilateral_rgb_std: float = 5.0,
 ) -> np.ndarray:
+    """Run DenseCRF with a logistic unary centered at threshold_center; returns refined mask."""
     t0 = time_start()
     h, w, _ = img_rgb.shape
     assert score_map.shape == (h, w), "score_map must have shape (H, W)"
@@ -67,6 +68,7 @@ def refine_with_densecrf(
 
 
 def _crf_eval_worker(args):
+    """Process-pool helper to evaluate one CRF config; returns metrics and config dict."""
     (img_rgb_ds, score_map_ds, sh_mask_ds, gt_mask_ds, threshold_center, n_iters, cfg) = args
     prob_soft, pos_w, pos_xy, bi_w, bi_xy, bi_rgb = cfg
     mask_crf_local = refine_with_densecrf(
@@ -112,6 +114,7 @@ def crf_grid_search(
     num_workers: int = 1,
     backend: str = "process",
 ):
+    """Small grid search over CRF hyperparameters; optional downsampling + multiprocessing."""
     t0 = time_start()
     best_cfg = None
     best_mask = None

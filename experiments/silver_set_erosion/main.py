@@ -33,6 +33,7 @@ CRF_MAX_CONFIGS = getattr(cfg, "CRF_MAX_CONFIGS", 64)
 
 
 def init_model(model_name: str):
+    """Load DINOv3 backbone + processor on CPU/GPU with timing."""
     t0 = time_start()
     processor = AutoImageProcessor.from_pretrained(model_name)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -60,9 +61,10 @@ def main():
     # ------------------------------------------------------------
     # Init DINOv3 model & processor
     # ------------------------------------------------------------
-    model, processor, device = init_model(
-        model_name,     # name of pretrained DINOv3 model (e.g. "facebook/dinov3-large")
-    )
+    model, processor, device = init_model(model_name)
+    ps = getattr(cfg, "PATCH_SIZE", model.config.patch_size)
+    tile_size = getattr(cfg, "TILE_SIZE", 1024)
+    stride = getattr(cfg, "STRIDE", tile_size)
 
     # ------------------------------------------------------------
     # Resolve paths to imagery + SH_2022 + GT vector labels
@@ -145,10 +147,10 @@ def main():
         model,                  # DINO model for patch embeddings
         processor,              # processor for preprocessing
         device,                 # GPU/CPU device
-        model.config.patch_size,  # ps: ViT patch size (16)
-        1024,                   # tile_size: patch extraction block
-        512,                    # stride: tile overlap
-        0.1,                    # pos_frac_thresh: fraction of FG per patch
+        ps,                     # ps: ViT patch size
+        tile_size,              # tile_size: patch extraction block
+        stride,                 # stride: tile overlap
+        getattr(cfg, "POS_FRAC_THRESH", 0.1),  # pos_frac_thresh: fraction of FG per patch
         None,                   # aggregate_layers: None → default layer
         feature_dir,            # feature_dir: store tile-level embeddings
         image_id_a,             # unique ID for caching A’s tiles
@@ -163,9 +165,9 @@ def main():
         model,                  # DINO model
         processor,              # processor
         device,                 # GPU/CPU
-        model.config.patch_size,# ps: ViT patch size
-        1024,                   # tile_size
-        512,                    # stride
+        ps,                     # ps: ViT patch size
+        tile_size,              # tile_size
+        stride,                 # stride
         None,                   # aggregate_layers
         feature_dir,            # location to load/store B’s features
         image_id_b              # ID for B tiles
@@ -181,9 +183,9 @@ def main():
         model,                 # DINO model
         processor,             # image processor
         device,                # GPU device
-        model.config.patch_size, # ps
-        1024,                  # tile_size
-        512,                   # stride
+        ps,                    # ps
+        tile_size,             # tile_size
+        stride,                # stride
         cfg.K_VALUES,          # list of k-values to try (e.g. [1,3,5,7])
         cfg.THRESHOLDS,        # global thresholds for FG mask
         feature_dir,           # directory for B/features
@@ -273,7 +275,7 @@ def main():
     shadow_cfg, shadow_mask = shadow_filter_grid(
         img_b,                                 # RGB B
         best_crf_mask,                         # mask after CRF
-        gt_mask_B,                             # GT for scoring
+        gt_mask_eval,                          # GT for scoring
         cfg.SHADOW_WEIGHT_SETS,                # e.g. [(1,1,1), (0.7,1,1)]
         cfg.SHADOW_THRESHOLDS                  # thresholds in weighted-sum space
     )
@@ -339,7 +341,15 @@ def main():
         img_path,           # path to A
         img2_path,          # path to B
         buffer_m,           # SH buffer in meters
-        pixel_size_m        # pixel spacing in meters
+        pixel_size_m,       # pixel spacing in meters
+        shadow_cfg=shadow_cfg,
+        extra_settings={
+            "tile_size": tile_size,
+            "stride": stride,
+            "patch_size": ps,
+            "neg_alpha": getattr(cfg, "NEG_ALPHA", 1.0),
+            "pos_frac_thresh": getattr(cfg, "POS_FRAC_THRESH", 0.1),
+        },
     )
 
     time_end("main (total)", t0_main)

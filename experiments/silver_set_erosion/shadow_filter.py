@@ -1,8 +1,8 @@
+from concurrent.futures import ProcessPoolExecutor
 import numpy as np
+
 from metrics_utils import compute_metrics
 from timing_utils import time_start, time_end
-import numpy as np
-from concurrent.futures import ProcessPoolExecutor
 
 
 def _shadow_filter_single_weights(img_float: np.ndarray,
@@ -117,11 +117,9 @@ def shadow_filter_grid(img_rgb: np.ndarray,
                        num_workers: int = 1):
     """
     Filter out dark pixels under the mask using weighted RGB sums.
-    Returns best config and filtered mask.
 
-    Speed improvements:
-    - vectorized over thresholds (no Python loop per thr),
-    - optional parallelism over weight_sets.
+    Vectorizes all thresholds for each weight-set and optionally parallelizes
+    across weight sets. Returns the best (weights, threshold) and mask.
     """
     t0 = time_start()
 
@@ -186,8 +184,6 @@ def shadow_filter_grid(img_rgb: np.ndarray,
 
     #print stats
     print(f"[info] shadow_filter_grid: best config: {best_cfg_global}")
-    print(f"[info] best IOU after shadow filtering:{compute_metrics(best_mask_global.astype(np.uint8), gt_mask_bool.astype(np.uint8))['iou']:.4f}")
 
     time_end("shadow_filter_grid", t0)
     return best_cfg_global, best_mask_global
-

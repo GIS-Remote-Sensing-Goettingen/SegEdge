@@ -6,6 +6,7 @@ from timing_utils import time_start, time_end, DEBUG_TIMING, DEBUG_TIMING_VERBOS
 
 
 def compute_metrics(pred_mask: np.ndarray, gt_mask: np.ndarray) -> dict:
+    """Compute precision/recall/IoU/F1 and confusion counts for binary masks."""
     t0 = time.perf_counter() if DEBUG_TIMING and DEBUG_TIMING_VERBOSE else None
     pred = pred_mask.astype(bool)
     gt = gt_mask.astype(bool)
@@ -39,6 +40,7 @@ def compute_metrics_batch_gpu(score_map: np.ndarray,
                               gt_mask: np.ndarray,
                               device: torch.device,
                               batch_size: int = 8) -> list[dict]:
+    """Evaluate many thresholds in parallel on GPU; returns list of metric dicts."""
     t0 = time_start()
     score_t = torch.from_numpy(score_map.astype(np.float32)).to(device).flatten()
     gt_t = torch.from_numpy(gt_mask.astype(np.bool_)).to(device).flatten()
@@ -80,6 +82,7 @@ def compute_metrics_batch_cpu(score_map: np.ndarray,
                               sh_mask: np.ndarray | None,
                               gt_mask: np.ndarray,
                               batch_size: int = 16) -> list[dict]:
+    """CPU fallback for batched threshold evaluation."""
     t0 = time_start()
     flat_scores = score_map.astype(np.float32).reshape(1, -1)
     flat_gt = gt_mask.astype(bool).reshape(1, -1)
@@ -117,6 +120,7 @@ def compute_metrics_batch_cpu(score_map: np.ndarray,
 
 def compute_oracle_upper_bound(gt_mask: np.ndarray,
                                sh_mask: np.ndarray) -> dict:
+    """Compute oracle IoU if predictions are clipped to SH buffer (upper bound)."""
     t0 = time_start()
     oracle_mask = np.logical_and(gt_mask.astype(bool), sh_mask.astype(bool))
     metrics = compute_metrics(oracle_mask, gt_mask)

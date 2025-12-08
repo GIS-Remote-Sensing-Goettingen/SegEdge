@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 
 
 def save_plot(img_b, gt_mask_B, mask_raw_best, best_raw_config, best_crf_mask, best_crf_config, thr_center_for_crf, plot_dir, image_id_b, best_shadow=None):
+    """Save comparison figure (RGB, GT, raw, CRF, optional shadow) to plot_dir."""
     # Layout: if shadow provided, use 2x3; else 2x2
     if best_shadow is None:
         fig, axs = plt.subplots(2, 2, figsize=(16, 12))

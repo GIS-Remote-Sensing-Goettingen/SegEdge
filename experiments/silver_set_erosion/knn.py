@@ -30,6 +30,22 @@ def zero_shot_knn_single_scale_B_with_saliency(
     prefetched_tiles: dict | None = None,
     use_fp16_matmul: bool = False,
 ):
+    """
+    Compute kNN transfer scores on Image B using GPU matmul.
+
+    Args:
+        img_b: full RGB image.
+        pos_bank/neg_bank: patch banks from Image A.
+        ps: DINO patch size.
+        tile_size/stride: tiling parameters.
+        k: neighbors to average.
+        prefetched_tiles: optional in-memory feature cache.
+        neg_alpha: weight for negative bank subtraction.
+        use_fp16_matmul: enable half precision on CUDA for speed.
+    Returns:
+        score_full: per-pixel similarity map.
+        saliency_full: simple saliency from top-k sims.
+    """
     t0 = time_start()
     h_full, w_full = img_b.shape[:2]
     score_full = np.zeros((h_full, w_full), dtype=np.float32)
@@ -160,6 +176,9 @@ def grid_search_k_threshold(
     prefetched_tiles_b: dict | None = None,
     use_fp16_matmul: bool = False,
 ):
+    """
+    Sweep over k values and global thresholds on Image B; return best raw config + score map.
+    """
     t0 = time_start()
     best_raw_config = None
     best_raw_score_full = None
@@ -240,6 +259,7 @@ def fine_tune_threshold(
     step: float = 0.01,
     window: float = 0.08,
 ):
+    """Refine a scalar threshold around a base value; keeps best IoU mask."""
     t0 = time_start()
     thr_min = max(0.0, base_threshold - window)
     thr_max = min(1.0, base_threshold + window)

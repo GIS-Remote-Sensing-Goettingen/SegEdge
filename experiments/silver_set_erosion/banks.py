@@ -20,7 +20,13 @@ def build_banks_single_scale(img_a: np.ndarray,
                              feature_dir: str | None = None,
                              image_id: str | None = None,
                              bank_cache_dir: str | None = None):
-    """Build positive/negative banks from Image A labels, with optional caching."""
+    """
+    Build positive/negative patch banks from Image A using SH_2022 labels.
+
+    - Extract/caches DINO features per tile.
+    - Aggregates pixel labels to patch labels via pos_frac_thresh.
+    - Optionally loads/saves banks to disk to avoid recomputation.
+    """
     t0 = time_start()
 
     if bank_cache_dir is not None and image_id is not None:
