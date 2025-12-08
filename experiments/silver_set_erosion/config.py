@@ -33,4 +33,6 @@ SHADOW_WEIGHT_SETS = [
     (0.7, 1.0, 1.0),
     (0.5, 0.8, 1.0),
 ]
-SHADOW_THRESHOLDS = [50, 75, 100, 125, 150, 175]
+
+# Better initial guesses for 8-bit RGB in [0,255]
+SHADOW_THRESHOLDS = [180, 210, 240, 270, 300, 330, 360, 450 ,500]
