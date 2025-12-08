@@ -44,102 +44,167 @@ def init_model(model_name: str):
 
 
 def main():
+    """
+    Full segmentation pipeline:
+         • Build banks from Image A
+         • kNN transfer to Image B
+         • Threshold selection
+         • CRF refinement
+         • Shadow filtering
+         • Export diagnostics + shapefiles
+    """
+
     t0_main = time_start()
     model_name = cfg.MODEL_NAME
-    model, processor, device = init_model(model_name)
 
-    # Paths
+    # ------------------------------------------------------------
+    # Init DINOv3 model & processor
+    # ------------------------------------------------------------
+    model, processor, device = init_model(
+        model_name,     # name of pretrained DINOv3 model (e.g. "facebook/dinov3-large")
+    )
+
+    # ------------------------------------------------------------
+    # Resolve paths to imagery + SH_2022 + GT vector labels
+    # ------------------------------------------------------------
     img_path = cfg.IMG_PATH
     img2_path = cfg.IMG2_PATH
     lab_path = cfg.LAB_PATH
     gt_vector_path = cfg.GT_VECTOR_PATH
 
-    # Load data
+    # ------------------------------------------------------------
+    # Load imagery and reproject labels
+    # ------------------------------------------------------------
     t0_data = time_start()
-    img = load_dop20_image(img_path)
-    labels_A = reproject_labels_to_image(img_path, lab_path)
-    img_b = load_dop20_image(img2_path)
-    labels_SH_B = reproject_labels_to_image(img2_path, lab_path)
-    gt_mask_B = rasterize_vector_labels(gt_vector_path, img2_path)
+    img = load_dop20_image(
+        img_path        # source path for DOP20 orthophoto A (bank image)
+    )
+    labels_A = reproject_labels_to_image(
+        img_path,       # image A path (target CRS/grid)
+        lab_path        # SH_2022 raster to reproject
+    )
+
+    img_b = load_dop20_image(
+        img2_path       # target image B for inference
+    )
+    labels_SH_B = reproject_labels_to_image(
+        img2_path,      # image B path
+        lab_path        # SH_2022 raster
+    )
+
+    gt_mask_B = rasterize_vector_labels(
+        gt_vector_path, # vector ground truth polygons for B
+        img2_path       # raster reference to match CRS/resolution
+    )
     time_end("data_loading_and_reprojection", t0_data)
+
     print(f"[debug] GT positives on B: {gt_mask_B.sum()}")
     print(f"[debug] SH_2022 positives on B: {(labels_SH_B > 0).sum()}")
 
-    # Buffer
+    # ------------------------------------------------------------
+    # Build SH_2022 buffer (spatial prior)
+    # ------------------------------------------------------------
     with __import__('rasterio').open(img2_path) as src:
         pixel_size_m = abs(src.transform.a)
+
     buffer_m = cfg.BUFFER_M
     buffer_pixels = int(round(buffer_m / pixel_size_m))
     print(f"[info] pixel_size={pixel_size_m:.3f} m, buffer_m={buffer_m}, buffer_pixels={buffer_pixels}")
-    sh_buffer_mask_B = build_sh_buffer_mask(labels_SH_B, buffer_pixels)
-    _ = compute_oracle_upper_bound(gt_mask_B, sh_buffer_mask_B)
 
+    sh_buffer_mask_B = build_sh_buffer_mask(
+        labels_SH_B,    # SH_2022 label raster on B
+        buffer_pixels   # radius in pixel units for dilation
+    )
+
+    _ = compute_oracle_upper_bound(
+        gt_mask_B,      # GT mask on B
+        sh_buffer_mask_B  # SH buffer region (max allowed FG region)
+    )
+
+    # ------------------------------------------------------------
+    # Feature caching
+    # ------------------------------------------------------------
     feature_dir = cfg.FEATURE_DIR
     os.makedirs(feature_dir, exist_ok=True)
+
     image_id_a = os.path.splitext(os.path.basename(img_path))[0]
     image_id_b = os.path.splitext(os.path.basename(img2_path))[0]
 
-    # Banks
+    # ------------------------------------------------------------
+    # Build DINOv3 positive/negative banks on Image A
+    # ------------------------------------------------------------
     pos_bank, neg_bank = build_banks_single_scale(
-        img_a=img,
-        labels_a=labels_A,
-        model=model,
-        processor=processor,
-        device=device,
-        ps=model.config.patch_size,
-        tile_size=1024,
-        stride=512,
-        pos_frac_thresh=0.1,
-        aggregate_layers=None,
-        feature_dir=feature_dir,
-        image_id=image_id_a,
-        bank_cache_dir=cfg.BANK_CACHE_DIR,
+        img,                    # img_a: RGB array of image A
+        labels_A,               # labels_a: SH_2022 labels on A
+        model,                  # DINO model for patch embeddings
+        processor,              # processor for preprocessing
+        device,                 # GPU/CPU device
+        model.config.patch_size,  # ps: ViT patch size (16)
+        1024,                   # tile_size: patch extraction block
+        512,                    # stride: tile overlap
+        0.1,                    # pos_frac_thresh: fraction of FG per patch
+        None,                   # aggregate_layers: None → default layer
+        feature_dir,            # feature_dir: store tile-level embeddings
+        image_id_a,             # unique ID for caching A’s tiles
+        cfg.BANK_CACHE_DIR      # bank cache directory (reuses banks)
     )
 
-    # Prefetch B features
+    # ------------------------------------------------------------
+    # Prefetch DINO features for Image B (so kNN grid search is fast)
+    # ------------------------------------------------------------
     prefetched_b = prefetch_features_single_scale_image(
-        img_hw3=img_b,
-        model=model,
-        processor=processor,
-        device=device,
-        ps=model.config.patch_size,
-        tile_size=1024,
-        stride=512,
-        aggregate_layers=None,
-        feature_dir=feature_dir,
-        image_id=image_id_b,
+        img_b,                  # img_hw3: RGB array of image B
+        model,                  # DINO model
+        processor,              # processor
+        device,                 # GPU/CPU
+        model.config.patch_size,# ps: ViT patch size
+        1024,                   # tile_size
+        512,                    # stride
+        None,                   # aggregate_layers
+        feature_dir,            # location to load/store B’s features
+        image_id_b              # ID for B tiles
     )
 
-    # kNN grid search
+    # ------------------------------------------------------------
+    # kNN grid search (k-values × thresholds)
+    # ------------------------------------------------------------
     best_raw_config, best_raw_score_full, best_raw_saliency_full = grid_search_k_threshold(
-        img_b=img_b,
-        pos_bank=pos_bank,
-        neg_bank=neg_bank,
-        model=model,
-        processor=processor,
-        device=device,
-        ps=model.config.patch_size,
-        tile_size=1024,
-        stride=512,
-        k_values=cfg.K_VALUES,
-        thresholds=cfg.THRESHOLDS,
-        feature_dir=feature_dir,
-        image_id_b=image_id_b,
-        sh_buffer_mask_b=sh_buffer_mask_B,
-        gt_mask_b=gt_mask_B,
-        prefetched_tiles_b=prefetched_b,
-        use_fp16_matmul=USE_FP16_KNN,
+        img_b,                 # full RGB image B
+        pos_bank,              # positive bank (N_pos × C)
+        neg_bank,              # negative bank (N_neg × C)
+        model,                 # DINO model
+        processor,             # image processor
+        device,                # GPU device
+        model.config.patch_size, # ps
+        1024,                  # tile_size
+        512,                   # stride
+        cfg.K_VALUES,          # list of k-values to try (e.g. [1,3,5,7])
+        cfg.THRESHOLDS,        # global thresholds for FG mask
+        feature_dir,           # directory for B/features
+        image_id_b,            # B tile cache ID
+        sh_buffer_mask_B,      # spatial prior mask
+        gt_mask_B,             # ground-truth for scoring
+        prefetched_b,          # cached DINO features for B
+        USE_FP16_KNN           # use half precision matmul for speed
     )
 
-    # Fine-tune threshold
+    # ------------------------------------------------------------
+    # Local threshold refinement around the best raw solution
+    # ------------------------------------------------------------
     thr_best_raw_refined, metrics_raw_refined, mask_raw_best = fine_tune_threshold(
-        score_map=best_raw_score_full,
-        base_threshold=best_raw_config["threshold"],
-        sh_mask=sh_buffer_mask_B,
-        gt_mask=gt_mask_B,
+        best_raw_score_full,   # score_map from best k
+        best_raw_config["threshold"],  # base threshold to refine
+        sh_buffer_mask_B,      # prior mask
+        gt_mask_B              # GT for evaluation
     )
+
+    # Update configuration if refined solution is better
     if metrics_raw_refined["iou"] >= best_raw_config["iou"]:
-        best_raw_config = {**best_raw_config, "threshold": thr_best_raw_refined, **metrics_raw_refined}
+        best_raw_config = {
+            **best_raw_config,
+            "threshold": thr_best_raw_refined,
+            **metrics_raw_refined,
+        }
     else:
         mask_raw_best = best_raw_score_full >= best_raw_config["threshold"]
         mask_raw_best = np.logical_and(mask_raw_best, sh_buffer_mask_B)
@@ -149,62 +214,128 @@ def main():
     thr_center_for_crf = champion_config["threshold"]
     k_center_for_crf = champion_config["k"]
 
-    # CRF search
+    # ------------------------------------------------------------
+    # CRF grid search (spatial regularization)
+    # ------------------------------------------------------------
     best_crf_cfg_inner, best_crf_mask = crf_grid_search(
-        img_rgb=img_b,
-        score_map=champion_score_full,
-        threshold_center=thr_center_for_crf,
-        sh_mask=sh_buffer_mask_B,
-        gt_mask=gt_mask_B,
-        prob_softness_vals=cfg.PROB_SOFTNESS_VALUES,
-        pos_w_vals=cfg.POS_W_VALUES,
-        pos_xy_std_vals=cfg.POS_XY_STD_VALUES,
-        bilateral_w_vals=cfg.BILATERAL_W_VALUES,
-        bilateral_xy_std_vals=cfg.BILATERAL_XY_STD_VALUES,
-        bilateral_rgb_std_vals=cfg.BILATERAL_RGB_STD_VALUES,
-        n_iters=5,
-        max_configs=CRF_MAX_CONFIGS,
-        downsample_factor=2,
-        num_workers=getattr(cfg, "CRF_NUM_WORKERS", 8),
-        backend="process",
+        img_b,                       # RGB on B
+        champion_score_full,         # score map from best raw stage
+        thr_center_for_crf,          # CRF unary logistic center
+        sh_buffer_mask_B,            # prior mask
+        gt_mask_B,                   # GT mask
+        cfg.PROB_SOFTNESS_VALUES,    # CRF unary softness candidates
+        cfg.POS_W_VALUES,            # Gaussian pairwise compat weights
+        cfg.POS_XY_STD_VALUES,       # Gaussian XY sigma
+        cfg.BILATERAL_W_VALUES,      # bilateral compat weights
+        cfg.BILATERAL_XY_STD_VALUES, # bilateral XY sigma
+        cfg.BILATERAL_RGB_STD_VALUES,# bilateral RGB sigma
+        5,                           # n_iters: mean-field iterations
+        CRF_MAX_CONFIGS,             # max configs to search
+        2,                           # downsample_factor: speed boost
+        cfg.CRF_NUM_WORKERS,         # multiprocessing workers
+        "process"                    # backend: process-based parallelism
     )
 
-    best_crf_config = {"k": k_center_for_crf, **best_crf_cfg_inner}
+    best_crf_config = {
+        "k": k_center_for_crf,       # inherited from raw best
+        **best_crf_cfg_inner         # CRF hyperparams
+    }
+
+    # If CRF was computed at lower resolution → upsample to original grid
     if best_crf_mask.shape != img_b.shape[:2]:
-        best_crf_mask_full = resize(best_crf_mask.astype(np.float32), (img_b.shape[0], img_b.shape[1]), order=0, preserve_range=True, anti_aliasing=False) > 0.5
+        best_crf_mask_full = resize(
+            best_crf_mask.astype(np.float32),   # low-res CRF output
+            (img_b.shape[0], img_b.shape[1]),   # original size
+            order=0, preserve_range=True, anti_aliasing=False
+        ) > 0.5
         best_crf_mask = best_crf_mask_full
-        metrics_crf_full = compute_metrics(best_crf_mask, gt_mask_B)
+
+        metrics_crf_full = compute_metrics(
+            best_crf_mask,      # upsampled CRF mask
+            gt_mask_B           # GT
+        )
         print(
             f"[crf-upsampled] IoU={metrics_crf_full['iou']:.3f}, "
             f"F1={metrics_crf_full['f1']:.3f}, "
-            f"P={metrics_crf_full['precision']:.3f}, R={metrics_crf_full['recall']:.3f}"
+            f"P={metrics_crf_full['precision']:.3f}, "
+            f"R={metrics_crf_full['recall']:.3f}"
         )
 
-    # Shadow filtering
+    # ------------------------------------------------------------
+    # Shadow filtering stage
+    # ------------------------------------------------------------
     shadow_cfg, shadow_mask = shadow_filter_grid(
-        img_rgb=img_b,
-        base_mask=best_crf_mask,
-        gt_mask=gt_mask_B,
-        weight_sets=getattr(cfg, "SHADOW_WEIGHT_SETS", [(1.0, 1.0, 1.0)]),
-        thresholds=getattr(cfg, "SHADOW_THRESHOLDS", [100]),
+        img_b,                                 # RGB B
+        best_crf_mask,                         # mask after CRF
+        gt_mask_B,                             # GT for scoring
+        cfg.SHADOW_WEIGHT_SETS,                # e.g. [(1,1,1), (0.7,1,1)]
+        cfg.SHADOW_THRESHOLDS                  # thresholds in weighted-sum space
     )
     shadow_best = {"cfg": shadow_cfg, "mask": shadow_mask}
 
-    # Plot
-    save_plot(img_b, gt_mask_B, mask_raw_best, best_raw_config, best_crf_mask, best_crf_config, thr_center_for_crf, cfg.PLOT_DIR, image_id_b, best_shadow=shadow_best)
+    # ------------------------------------------------------------
+    # Diagnostics + visualization
+    # ------------------------------------------------------------
+    save_plot(
+        img_b,                 # RGB B
+        gt_mask_B,             # GT mask
+        mask_raw_best,         # raw (after refined threshold)
+        best_raw_config,       # raw pipeline config
+        best_crf_mask,         # CRF output
+        best_crf_config,       # CRF config
+        thr_center_for_crf,    # raw threshold used for CRF unary center
+        cfg.PLOT_DIR,          # where to save plots
+        image_id_b,            # identifier for outputs
+        best_shadow=shadow_best  # shadow filtering results
+    )
 
-    # Shapefiles
+    # ------------------------------------------------------------
+    # Export shapefiles (raw, CRF, shadow)
+    # ------------------------------------------------------------
     base_name_b = os.path.splitext(os.path.basename(img2_path))[0]
     out_dir_b = os.path.dirname(img2_path)
-    export_mask_to_shapefile(mask_raw_best, img2_path, os.path.join(out_dir_b, f"{base_name_b}_pred_mask_best_raw.shp"))
-    export_mask_to_shapefile(best_crf_mask, img2_path, os.path.join(out_dir_b, f"{base_name_b}_pred_mask_best_crf.shp"))
-    export_mask_to_shapefile(shadow_mask, img2_path, os.path.join(out_dir_b, f"{base_name_b}_pred_mask_best_shadow.shp"))
 
-    # Consolidate features
-    consolidate_features_for_image(feature_dir, image_id_a)
-    consolidate_features_for_image(feature_dir, image_id_b)
+    export_mask_to_shapefile(
+        mask_raw_best,                         # raw prediction mask
+        img2_path,                             # reference image
+        os.path.join(out_dir_b, f"{base_name_b}_pred_mask_best_raw.shp")
+    )
+    export_mask_to_shapefile(
+        best_crf_mask,                         # CRF-refined mask
+        img2_path,
+        os.path.join(out_dir_b, f"{base_name_b}_pred_mask_best_crf.shp")
+    )
+    export_mask_to_shapefile(
+        shadow_mask,                           # shadow-filtered final mask
+        img2_path,
+        os.path.join(out_dir_b, f"{base_name_b}_pred_mask_best_shadow.shp")
+    )
 
-    export_best_settings(best_raw_config, best_crf_config, model_name, img_path, img2_path, buffer_m, pixel_size_m)
+    # ------------------------------------------------------------
+    # Consolidate tile-level feature files (.npy) → one per image
+    # ------------------------------------------------------------
+    consolidate_features_for_image(
+        feature_dir,        # directory containing tile features
+        image_id_a          # ID for image A
+    )
+    consolidate_features_for_image(
+        feature_dir,
+        image_id_b          # ID for image B
+    )
+
+    # ------------------------------------------------------------
+    # Export best settings for reproducibility
+    # ------------------------------------------------------------
+    export_best_settings(
+        best_raw_config,    # raw pipeline config
+        best_crf_config,    # CRF config
+        model_name,         # DINO model name
+        img_path,           # path to A
+        img2_path,          # path to B
+        buffer_m,           # SH buffer in meters
+        pixel_size_m        # pixel spacing in meters
+    )
+
     time_end("main (total)", t0_main)
 
 
