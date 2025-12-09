@@ -7,9 +7,9 @@ def save_plot(img_b, gt_mask_B, mask_raw_best, best_raw_config, best_crf_mask, b
     """Save comparison figure (RGB, GT, raw, CRF, optional shadow) to plot_dir."""
     # Layout: if shadow provided, use 2x3; else 2x2
     if best_shadow is None:
-        fig, axs = plt.subplots(2, 2, figsize=(16, 12))
+        fig, axs = plt.subplots(2, 2, figsize=(16*1.5, 12*1.5))
     else:
-        fig, axs = plt.subplots(2, 3, figsize=(22, 12))
+        fig, axs = plt.subplots(2, 3, figsize=(22*1.5, 12*1.5))
     axs[0, 0].imshow(img_b)
     axs[0, 0].set_title("Image B (RGB)")
     axs[0, 0].axis("off")
@@ -56,3 +56,75 @@ def save_plot(img_b, gt_mask_B, mask_raw_best, best_raw_config, best_crf_mask, b
     fig.savefig(plot_path, dpi=150)
     plt.close(fig)
     print(f"[plot] saved to {plot_path}")
+
+
+def save_best_model_plot(img_b, gt_mask, pred_mask, title, plot_dir, image_id_b, filename_suffix="champion.png"):
+    """Save a simple overlay plot of the champion mask vs GT."""
+    fig, axs = plt.subplots(1, 3, figsize=(18, 6))
+    axs[0].imshow(img_b)
+    axs[0].set_title("Image B (RGB)")
+    axs[0].axis("off")
+
+    axs[1].imshow(gt_mask.astype(bool), cmap="gray")
+    axs[1].set_title("Ground Truth")
+    axs[1].axis("off")
+
+    overlay = img_b.copy()
+    overlay[pred_mask] = (0.5 * overlay[pred_mask] + 0.5 * np.array([255, 0, 0])).astype(overlay.dtype)
+    axs[2].imshow(overlay)
+    axs[2].set_title(title)
+    axs[2].axis("off")
+
+    plt.tight_layout()
+    os.makedirs(plot_dir, exist_ok=True)
+    plot_path = os.path.join(plot_dir, f"{image_id_b}_{filename_suffix}")
+    fig.savefig(plot_path, dpi=150)
+    plt.close(fig)
+    print(f"[plot] saved champion overlay to {plot_path}")
+
+
+def save_knn_xgb_gt_plot(img_b,
+                         gt_mask,
+                         mask_knn,
+                         mask_xgb,
+                         plot_dir,
+                         image_id_b,
+                         title_knn="kNN",
+                         title_xgb="XGBoost",
+                         filename_suffix="knn_xgb_gt.png"):
+    """Save three panels: RGB+GT overlay, RGB+kNN overlay, RGB+XGB overlay."""
+    fig, axs = plt.subplots(1, 3, figsize=(24, 8))
+
+    # GT overlay
+    overlay_gt = img_b.copy()
+    overlay_gt[gt_mask.astype(bool)] = (
+        0.5 * overlay_gt[gt_mask.astype(bool)] + 0.5 * np.array([0, 0, 255])
+    ).astype(overlay_gt.dtype)
+    axs[0].imshow(overlay_gt)
+    axs[0].set_title("GT overlay")
+    axs[0].axis("off")
+
+    # kNN overlay
+    overlay_knn = img_b.copy()
+    overlay_knn[mask_knn.astype(bool)] = (
+        0.5 * overlay_knn[mask_knn.astype(bool)] + 0.5 * np.array([0, 255, 0])
+    ).astype(overlay_knn.dtype)
+    axs[1].imshow(overlay_knn)
+    axs[1].set_title(title_knn)
+    axs[1].axis("off")
+
+    # XGB overlay
+    overlay_xgb = img_b.copy()
+    overlay_xgb[mask_xgb.astype(bool)] = (
+        0.5 * overlay_xgb[mask_xgb.astype(bool)] + 0.5 * np.array([255, 0, 0])
+    ).astype(overlay_xgb.dtype)
+    axs[2].imshow(overlay_xgb)
+    axs[2].set_title(title_xgb)
+    axs[2].axis("off")
+
+    plt.tight_layout()
+    os.makedirs(plot_dir, exist_ok=True)
+    plot_path = os.path.join(plot_dir, f"{image_id_b}_{filename_suffix}")
+    fig.savefig(plot_path, dpi=150)
+    plt.close(fig)
+    print(f"[plot] saved kNN/XGB/GT overlay to {plot_path}")

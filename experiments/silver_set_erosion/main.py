@@ -7,7 +7,15 @@ import torch
 from skimage.transform import resize
 
 import config as cfg
+from experiments.silver_set_erosion.xdboost import (
+    build_xgb_dataset,
+    train_xgb_classifier,
+    hyperparam_search_xgb,
+    hyperparam_search_xgb_iou,
+    xgb_score_image_b,
+)
 from timing_utils import time_start, time_end, DEBUG_TIMING
+from scipy.ndimage import median_filter
 from io_utils import (
     load_dop20_image,
     reproject_labels_to_image,
@@ -20,9 +28,10 @@ from io_utils import (
 from features import prefetch_features_single_scale_image
 from banks import build_banks_single_scale
 from knn import grid_search_k_threshold, fine_tune_threshold
-from metrics_utils import compute_oracle_upper_bound, compute_metrics
+from metrics_utils import compute_oracle_upper_bound, compute_metrics, compute_metrics_batch_cpu, \
+    compute_metrics_batch_gpu
 from crf_utils import crf_grid_search
-from plotting import save_plot
+from plotting import save_plot, save_best_model_plot, save_knn_xgb_gt_plot
 from transformers import AutoImageProcessor, AutoModel
 from shadow_filter import shadow_filter_grid
 
@@ -217,11 +226,141 @@ def main():
         mask_raw_best = best_raw_score_full >= best_raw_config["threshold"]
         mask_raw_best = np.logical_and(mask_raw_best, sh_buffer_mask_B)
 
+    # Median filter to clean speckle after thresholding
+    mask_raw_best = median_filter(mask_raw_best.astype(np.uint8), size=3) > 0
+    metrics_raw_filtered = compute_metrics(mask_raw_best, gt_mask_eval)
+    best_raw_config = {**best_raw_config, **metrics_raw_filtered}
+
+    # Preserve kNN mask/config before potential champion swap
+    mask_knn = mask_raw_best.copy()
+    knn_config = best_raw_config.copy()
+
     champion_config = best_raw_config
     champion_score_full = best_raw_score_full
     thr_center_for_crf = champion_config["threshold"]
     k_center_for_crf = champion_config["k"]
 
+    # ------------------------------------------------------------
+    # XGBoost branch (patch-level classifier)
+    # ------------------------------------------------------------
+    X, y = build_xgb_dataset(
+        img,
+        labels_A,
+        ps,
+        tile_size,
+        stride,
+        feature_dir,
+        image_id_a,
+        pos_frac=cfg.POS_FRAC_THRESH,
+        max_neg=getattr(cfg, "MAX_NEG_BANK", 8000),
+    )
+
+    use_gpu_xgb = getattr(cfg, "XGB_USE_GPU", True)
+    param_grid = getattr(cfg, "XGB_PARAM_GRID", None)
+    num_boost_round = getattr(cfg, "XGB_NUM_BOOST_ROUND", 300)
+    early_stop = getattr(cfg, "XGB_EARLY_STOP", 40)
+    verbose_eval = getattr(cfg, "XGB_VERBOSE_EVAL", 50)
+    val_fraction = getattr(cfg, "XGB_VAL_FRACTION", 0.2)
+
+    if param_grid:
+        bst, best_params_xgb, best_iou_xgb, best_thr_xgb, best_metrics_xgb = hyperparam_search_xgb_iou(
+            X,
+            y,
+            cfg.THRESHOLDS,
+            sh_buffer_mask_B,
+            gt_mask_eval,
+            img_b,
+            ps,
+            tile_size,
+            stride,
+            feature_dir,
+            image_id_b,
+            prefetched_tiles=prefetched_b,
+            device=device,
+            use_gpu=use_gpu_xgb,
+            param_grid=param_grid,
+            num_boost_round=num_boost_round,
+            val_fraction=val_fraction,
+            early_stopping_rounds=early_stop,
+            verbose_eval=verbose_eval,
+            seed=42,
+        )
+        best_xgb = best_metrics_xgb
+        best_xgb_config = {
+            "k": -1,
+            "threshold": best_thr_xgb,
+            "source": "xgb",
+            **best_xgb,
+            "params": best_params_xgb,
+        }
+        score_full_xgb = xgb_score_image_b(img_b, bst, ps, tile_size, stride, feature_dir, image_id_b, prefetched_tiles=prefetched_b)
+        mask_xgb = (score_full_xgb >= best_thr_xgb) & sh_buffer_mask_B
+        mask_xgb = median_filter(mask_xgb.astype(np.uint8), size=3) > 0
+        metrics_xgb_filtered = compute_metrics(mask_xgb, gt_mask_eval)
+        best_xgb_config = {**best_xgb_config, **metrics_xgb_filtered}
+        print(f"[xgb-best] thr={best_thr_xgb:.3f}, IoU={best_xgb_config['iou']:.3f}, F1={best_xgb_config['f1']:.3f}")
+    else:
+        bst = train_xgb_classifier(
+            X,
+            y,
+            use_gpu=use_gpu_xgb,
+            num_boost_round=num_boost_round,
+            verbose_eval=verbose_eval,
+        )
+        best_params_xgb = None
+        score_full_xgb = xgb_score_image_b(img_b, bst, ps, tile_size, stride, feature_dir, image_id_b, prefetched_tiles=prefetched_b)
+        try:
+            metrics_list = compute_metrics_batch_gpu(score_full_xgb, cfg.THRESHOLDS, sh_buffer_mask_B, gt_mask_eval, device=device)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            metrics_list = compute_metrics_batch_cpu(score_full_xgb, cfg.THRESHOLDS, sh_buffer_mask_B, gt_mask_eval)
+        best_xgb = max(metrics_list, key=lambda m: m["iou"])
+        mask_xgb = (score_full_xgb >= best_xgb["threshold"]) & sh_buffer_mask_B
+        mask_xgb = median_filter(mask_xgb.astype(np.uint8), size=3) > 0
+        metrics_xgb_filtered = compute_metrics(mask_xgb, gt_mask_eval)
+        best_xgb_config = {
+            "k": -1,
+            "threshold": best_xgb["threshold"],
+            "source": "xgb",
+            **metrics_xgb_filtered,
+            "params": best_params_xgb,
+        }
+        print(f"[xgb-best] thr={best_xgb['threshold']:.3f}, IoU={best_xgb_config['iou']:.3f}, F1={best_xgb_config['f1']:.3f}")
+
+    # Champion selection: choose better of kNN or XGB for CRF
+    if best_xgb_config["iou"] > champion_config["iou"]:
+        champion_config = best_xgb_config
+        champion_score_full = score_full_xgb
+        thr_center_for_crf = champion_config["threshold"]
+        k_center_for_crf = champion_config["k"]
+        mask_raw_best = mask_xgb
+
+    # Save GT vs kNN vs XGB overlays
+    save_knn_xgb_gt_plot(
+        img_b,
+        gt_mask_eval,
+        mask_knn,
+        mask_xgb,
+        cfg.PLOT_DIR,
+        image_id_b,
+        title_knn=f"kNN IoU={knn_config['iou']:.3f}",
+        title_xgb=f"XGB IoU={best_xgb_config['iou']:.3f}",
+        filename_suffix="knn_vs_xgb.png",
+    )
+
+    # Quick visualization of champion vs GT before CRF
+    save_best_model_plot(
+        img_b,
+        gt_mask_eval,
+        mask_raw_best,
+        title=f"Champion ({champion_config['source']}) IoU={champion_config['iou']:.3f}",
+        plot_dir=cfg.PLOT_DIR,
+        image_id_b=image_id_b,
+        filename_suffix="champion_pre_crf.png",
+    )
+
+
+    raise
     # ------------------------------------------------------------
     # CRF grid search (spatial regularization)
     # ------------------------------------------------------------
