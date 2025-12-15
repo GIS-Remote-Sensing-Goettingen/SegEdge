@@ -53,7 +53,7 @@ CLIP_GT_TO_BUFFER = True  # if True, ignore GT outside the SH buffer (max IoU ca
 # XGBoost options
 XGB_USE_GPU = True
 XGB_VAL_FRACTION = 0.2
-XGB_NUM_BOOST_ROUND = 20
+XGB_NUM_BOOST_ROUND = 10
 XGB_EARLY_STOP = 40
 XGB_VERBOSE_EVAL = 20
 # Optional search grid (list of partial param dicts that override the base defaults in xdboost.py)

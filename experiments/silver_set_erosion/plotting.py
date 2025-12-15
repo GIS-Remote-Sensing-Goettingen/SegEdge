@@ -53,7 +53,7 @@ def save_plot(img_b, gt_mask_B, mask_raw_best, best_raw_config, best_crf_mask, b
     plt.tight_layout()
     os.makedirs(plot_dir, exist_ok=True)
     plot_path = os.path.join(plot_dir, f"{image_id_b}_raw_crf.png")
-    fig.savefig(plot_path, dpi=150)
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"[plot] saved to {plot_path}")
 
@@ -78,7 +78,7 @@ def save_best_model_plot(img_b, gt_mask, pred_mask, title, plot_dir, image_id_b,
     plt.tight_layout()
     os.makedirs(plot_dir, exist_ok=True)
     plot_path = os.path.join(plot_dir, f"{image_id_b}_{filename_suffix}")
-    fig.savefig(plot_path, dpi=150)
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"[plot] saved champion overlay to {plot_path}")
 
@@ -125,6 +125,6 @@ def save_knn_xgb_gt_plot(img_b,
     plt.tight_layout()
     os.makedirs(plot_dir, exist_ok=True)
     plot_path = os.path.join(plot_dir, f"{image_id_b}_{filename_suffix}")
-    fig.savefig(plot_path, dpi=150)
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"[plot] saved kNN/XGB/GT overlay to {plot_path}")

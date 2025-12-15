@@ -359,8 +359,13 @@ def main():
         filename_suffix="champion_pre_crf.png",
     )
 
+    # Free large intermediates before CRF
+    for _obj in ["pos_bank", "neg_bank", "prefetched_b", "best_raw_score_full", "best_raw_saliency_full", "score_full_xgb"]:
+        if _obj in locals():
+            del locals()[_obj]
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
-    raise
     # ------------------------------------------------------------
     # CRF grid search (spatial regularization)
     # ------------------------------------------------------------
