@@ -1,9 +1,11 @@
 from concurrent.futures import ProcessPoolExecutor
 import numpy as np
+import logging
 
 from metrics_utils import compute_metrics
 from timing_utils import time_start, time_end
 
+logger = logging.getLogger(__name__)
 
 def _shadow_filter_single_weights(img_float: np.ndarray,
                                   base_mask: np.ndarray,
@@ -183,7 +185,7 @@ def shadow_filter_grid(img_rgb: np.ndarray,
                     best_mask_global = mask
 
     #print stats
-    print(f"[info] shadow_filter_grid: best config: {best_cfg_global}")
+    logger.info("shadow_filter_grid best config: %s", best_cfg_global)
 
     time_end("shadow_filter_grid", t0)
     return best_cfg_global, best_mask_global

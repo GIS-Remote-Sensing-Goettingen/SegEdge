@@ -1,4 +1,5 @@
 import time
+import logging
 import config as cfg
 
 
@@ -6,6 +7,7 @@ import config as cfg
 DEBUG_TIMING = getattr(cfg, "DEBUG_TIMING", True)
 DEBUG_TIMING_VERBOSE = getattr(cfg, "DEBUG_TIMING_VERBOSE", False)
 
+logger = logging.getLogger(__name__)
 
 def time_start():
     """Return a perf counter start if timing is enabled."""
@@ -15,8 +17,8 @@ def time_start():
 
 
 def time_end(label: str, t0):
-    """Print elapsed time for a block if timing is enabled."""
+    """Log elapsed time for a block if timing is enabled."""
     if not DEBUG_TIMING or t0 is None:
         return
     dt = time.perf_counter() - t0
-    print(f"[time] {label}: {dt:.3f} s")
+    logger.info("time %s: %.3f s", label, dt)

@@ -1,15 +1,25 @@
 import os
 import time
+import logging
 
 import numpy as np
 import torch
 from skimage.transform import resize
 
-from features import tile_iterator, crop_to_multiple_of_ps, extract_patch_features_single_scale, tile_feature_path, save_tile_features
+from features import (
+    tile_iterator,
+    crop_to_multiple_of_ps,
+    extract_patch_features_single_scale,
+    tile_feature_path,
+    save_tile_features,
+    add_local_context_mean,
+)
 from metrics_utils import compute_metrics_batch_gpu, compute_metrics_batch_cpu
 from timing_utils import time_start, time_end, DEBUG_TIMING
 import config as cfg
 from metrics_utils import compute_metrics
+
+logger = logging.getLogger(__name__)
 
 
 def zero_shot_knn_single_scale_B_with_saliency(
@@ -29,6 +39,7 @@ def zero_shot_knn_single_scale_B_with_saliency(
     neg_alpha: float = 1.0,
     prefetched_tiles: dict | None = None,
     use_fp16_matmul: bool = False,
+    context_radius: int = 0,
 ):
     """
     Compute kNN transfer scores on Image B using GPU matmul.
@@ -62,18 +73,23 @@ def zero_shot_knn_single_scale_B_with_saliency(
         neg_bank_t_half = neg_bank_t.half() if use_fp16_matmul and device.type == "cuda" else None
         k_neg_eff = min(k, neg_bank_t.shape[0])
         use_neg = True
-        print(f"[info] zero_shot: using negative bank with size={neg_bank_t.shape[0]}, k_neg_eff={k_neg_eff}, alpha={neg_alpha}")
+        logger.info(
+            "zero_shot: using negative bank size=%s, k_neg_eff=%s, alpha=%s",
+            neg_bank_t.shape[0],
+            k_neg_eff,
+            neg_alpha,
+        )
     else:
         neg_bank_t = None
         neg_bank_t_half = None
         k_neg_eff = 0
         use_neg = False
-        print("[info] zero_shot: negative bank disabled (neg_bank is None)")
+        logger.info("zero_shot: negative bank disabled (neg_bank is None)")
 
     matmul_time = resize_time = 0.0
     if prefetched_tiles is not None:
         tile_iter = sorted(prefetched_tiles.items())
-        print(f"[perf] zero_shot: using prefetched features for {len(tile_iter)} tiles")
+        logger.debug("zero_shot: using prefetched features for %s tiles", len(tile_iter))
     else:
         tile_iter = tile_iterator(img_b, None, tile_size, stride)
 
@@ -108,6 +124,9 @@ def zero_shot_knn_single_scale_B_with_saliency(
                 computed_tiles += 1
                 if feature_dir is not None and image_id is not None:
                     save_tile_features(feats_tile, feature_dir, image_id, y, x)
+
+        if context_radius and context_radius > 0:
+            feats_tile = add_local_context_mean(feats_tile, context_radius)
 
         x_feats = feats_tile.reshape(-1, feats_tile.shape[-1]).astype(np.float32)
         with torch.no_grad():
@@ -151,9 +170,9 @@ def zero_shot_knn_single_scale_B_with_saliency(
     score_full[mask_nonzero] /= weight_full[mask_nonzero]
     saliency_full[mask_nonzero] /= weight_full[mask_nonzero]
     time_end(f"zero_shot_knn_single_scale_B_with_saliency (GPU, k={k})", t0)
-    print(f"[cache] B: cached tiles={cached_tiles}, computed tiles={computed_tiles}")
+    logger.info("B: cached tiles=%s, computed tiles=%s", cached_tiles, computed_tiles)
     if DEBUG_TIMING:
-        print(f"[perf] k={k} matmul_time={matmul_time:.2f}s, resize_time={resize_time:.2f}s")
+        logger.debug("k=%s matmul_time=%.2fs, resize_time=%.2fs", k, matmul_time, resize_time)
     return score_full, saliency_full
 
 
@@ -175,6 +194,7 @@ def grid_search_k_threshold(
     gt_mask_b: np.ndarray,
     prefetched_tiles_b: dict | None = None,
     use_fp16_matmul: bool = False,
+    context_radius: int = 0,
 ):
     """
     Sweep over k values and global thresholds on Image B; return best raw config + score map.
@@ -205,6 +225,7 @@ def grid_search_k_threshold(
             neg_alpha=getattr(cfg, "NEG_ALPHA", 1.0),
             prefetched_tiles=prefetched_tiles_b,
             use_fp16_matmul=use_fp16_matmul,
+            context_radius=context_radius,
         )
         time_end(f"grid_search_score_full(k={k})", t0_k_score)
 
@@ -222,7 +243,7 @@ def grid_search_k_threshold(
             except torch.cuda.OutOfMemoryError:
                 torch.cuda.empty_cache()
                 metrics_raw_list = None
-                print("[warn] OOM during GPU threshold metrics; falling back to CPU")
+                logger.warning("OOM during GPU threshold metrics; falling back to CPU")
         if metrics_raw_list is None:
             metrics_raw_list = compute_metrics_batch_cpu(
                 score_map=score_full,
@@ -236,7 +257,15 @@ def grid_search_k_threshold(
             thr = metrics_raw["threshold"]
             iou_raw = metrics_raw["iou"]
             f1_raw = metrics_raw["f1"]
-            print(f"[eval-raw] k={k}, thr={thr:.3f} -> IoU={iou_raw:.3f}, F1={f1_raw:.3f}, P={metrics_raw['precision']:.3f}, R={metrics_raw['recall']:.3f}")
+            logger.info(
+                "eval-raw k=%s, thr=%.3f -> IoU=%.3f, F1=%.3f, P=%.3f, R=%.3f",
+                k,
+                thr,
+                iou_raw,
+                f1_raw,
+                metrics_raw["precision"],
+                metrics_raw["recall"],
+            )
             if iou_raw > best_raw_iou:
                 best_raw_iou = iou_raw
                 best_raw_config = {"k": k, "threshold": thr, "source": "raw", **metrics_raw}
@@ -245,8 +274,7 @@ def grid_search_k_threshold(
 
         time_end(f"k_loop_total(k={k})", t0_k_total)
 
-    print("\n[best-raw] configuration:")
-    print(best_raw_config)
+    logger.info("best-raw configuration: %s", best_raw_config)
     time_end("grid_search_k_threshold", t0)
     return best_raw_config, best_raw_score_full, best_raw_saliency_full
 
@@ -278,9 +306,12 @@ def fine_tune_threshold(
             best_thr = thr
             best_metrics = metrics
             best_mask = mask
-    print(
-        f"[tune-thr] base={base_threshold:.3f} -> best={best_thr:.3f} "
-        f"IoU={best_metrics['iou']:.3f}, F1={best_metrics['f1']:.3f}"
+    logger.info(
+        "tune-thr base=%.3f -> best=%.3f IoU=%.3f, F1=%.3f",
+        base_threshold,
+        best_thr,
+        best_metrics["iou"],
+        best_metrics["f1"],
     )
     time_end("fine_tune_threshold", t0)
     return best_thr, best_metrics, best_mask

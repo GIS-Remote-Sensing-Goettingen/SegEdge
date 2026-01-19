@@ -1,4 +1,5 @@
 import os
+import logging
 import rasterio
 import fiona
 import numpy as np
@@ -14,6 +15,7 @@ from skimage.morphology import dilation, disk
 from timing_utils import time_start, time_end, DEBUG_TIMING, DEBUG_TIMING_VERBOSE
 import config as cfg
 
+logger = logging.getLogger(__name__)
 try:
     import cv2
     _HAS_CV2 = True
@@ -59,40 +61,55 @@ def reproject_labels_to_image(ref_img_path: str, labels_path: str) -> np.ndarray
     return labels_2d
 
 
-def rasterize_vector_labels(vector_path: str,
+def rasterize_vector_labels(vector_path: str | list[str],
                             ref_raster_path: str,
                             burn_value: int = 1) -> np.ndarray:
-    """Rasterize a vector layer onto the reference raster grid; auto-reprojects if CRS differs."""
+    """
+    Rasterize one or more vector layers onto the reference raster grid and union them.
+
+    - If vector_path is a list, each file is rasterized and combined with logical OR.
+    - Auto-reprojects geometries if CRS differs from the reference raster CRS.
+    """
     t0 = time_start()
+    vector_paths = vector_path if isinstance(vector_path, list) else [vector_path]
     with rasterio.open(ref_raster_path) as src:
         out_shape = (src.height, src.width)
         transform = src.transform
         raster_crs = src.crs
-    with fiona.open(vector_path, "r") as shp:
-        vec_crs = shp.crs
-        if not vec_crs:
-            print("[warn] vector CRS is missing/unknown; assuming EPSG:4326 (WGS84)")
-            vec_crs = CRS.from_epsg(4326).to_dict()
-        transformer = None
-        if raster_crs and vec_crs and vec_crs != raster_crs.to_dict():
-            print(f"[info] reprojecting vector geometries from {vec_crs} -> {raster_crs.to_dict()}")
-            transformer = Transformer.from_crs(vec_crs, raster_crs.to_dict(), always_xy=True)
-        shapes = []
-        for feat in shp:
-            geom = feat["geometry"]
-            if transformer is not None:
-                geom_obj = shape(geom)
-                geom_obj = shp_transform(transformer.transform, geom_obj)
-                geom = mapping(geom_obj)
-            shapes.append((geom, burn_value))
-    gt_mask = rfeatures.rasterize(
-        shapes=shapes,
-        out_shape=out_shape,
-        transform=transform,
-        fill=0,
-        all_touched=True,
-        dtype="uint8",
-    )
+    gt_mask = np.zeros(out_shape, dtype="uint8")
+
+    for vp in vector_paths:
+        with fiona.open(vp, "r") as shp:
+            vec_crs = shp.crs
+            if not vec_crs:
+                logger.warning("vector CRS missing for %s; assuming EPSG:4326 (WGS84)", vp)
+                vec_crs = CRS.from_epsg(4326).to_dict()
+            transformer = None
+            if raster_crs and vec_crs and vec_crs != raster_crs.to_dict():
+                logger.info("reprojecting vector geometries from %s -> %s for %s", vec_crs, raster_crs.to_dict(), vp)
+                transformer = Transformer.from_crs(vec_crs, raster_crs.to_dict(), always_xy=True)
+            shapes = []
+            for feat in shp:
+                geom = feat["geometry"]
+                if transformer is not None:
+                    geom_obj = shape(geom)
+                    geom_obj = shp_transform(transformer.transform, geom_obj)
+                    geom = mapping(geom_obj)
+                shapes.append((geom, burn_value))
+
+        if not shapes:
+            logger.warning("no geometries found in %s", vp)
+            continue
+
+        mask_i = rfeatures.rasterize(
+            shapes=shapes,
+            out_shape=out_shape,
+            transform=transform,
+            fill=0,
+            all_touched=True,
+            dtype="uint8",
+        )
+        gt_mask = np.maximum(gt_mask, mask_i)
     time_end("rasterize_vector_labels", t0)
     return gt_mask
 
@@ -132,20 +149,20 @@ def export_mask_to_shapefile(mask: np.ndarray, ref_raster_path: str, out_path: s
             shp.write({"geometry": geom, "properties": {"id": int(idx)}})
             idx += 1
     time_end("export_mask_to_shapefile", t0)
-    print(f"[info] shapefile written to: {out_path}")
+    logger.info("shapefile written to: %s", out_path)
 
 
 def consolidate_features_for_image(feature_dir: str, image_id: str, output_suffix: str = "_features_full.npy"):
     """Concatenate all tile feature .npy files for an image into a single array; return path."""
     t0 = time_start()
     if not os.path.isdir(feature_dir):
-        print(f"[warn] feature_dir does not exist: {feature_dir}")
+        logger.warning("feature_dir does not exist: %s", feature_dir)
         return None
     prefix = f"{image_id}_y"
     suffix = "_features.npy"
     files = [f for f in os.listdir(feature_dir) if f.startswith(prefix) and f.endswith(suffix)]
     if not files:
-        print(f"[warn] no feature tiles found for image_id={image_id} in {feature_dir}")
+        logger.warning("no feature tiles found for image_id=%s in %s", image_id, feature_dir)
         return None
     files = sorted(files)
     feats_list = []
@@ -157,7 +174,7 @@ def consolidate_features_for_image(feature_dir: str, image_id: str, output_suffi
     out_path = os.path.join(feature_dir, f"{image_id}{output_suffix}")
     np.save(out_path, feats_full)
     time_end(f"consolidate_features_for_image[{image_id}]", t0)
-    print(f"[info] consolidated {len(files)} tiles for {image_id} -> {out_path}, shape={feats_full.shape}")
+    logger.info("consolidated %s tiles for %s -> %s, shape=%s", len(files), image_id, out_path, feats_full.shape)
     return out_path
 
 
@@ -195,4 +212,4 @@ def export_best_settings(best_raw_config,
                 else:
                     f.write("  " * indent + f"{k}: {v}\n")
         _write_yaml(best_settings)
-    print(f"[config] best settings written to {cfg.BEST_SETTINGS_PATH}")
+    logger.info("best settings written to %s", cfg.BEST_SETTINGS_PATH)

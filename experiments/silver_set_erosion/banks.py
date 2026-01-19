@@ -1,11 +1,21 @@
 import os
+import logging
 import numpy as np
 from skimage.morphology import erosion, disk
 
-from features import tile_iterator, crop_to_multiple_of_ps, extract_patch_features_single_scale, labels_to_patch_masks, save_tile_features, tile_feature_path
+from features import (
+    tile_iterator,
+    crop_to_multiple_of_ps,
+    extract_patch_features_single_scale,
+    labels_to_patch_masks,
+    save_tile_features,
+    tile_feature_path,
+    add_local_context_mean,
+)
 from timing_utils import time_start, time_end
 import config as cfg
 
+logger = logging.getLogger(__name__)
 
 def build_banks_single_scale(img_a: np.ndarray,
                              labels_a: np.ndarray,
@@ -19,7 +29,8 @@ def build_banks_single_scale(img_a: np.ndarray,
                              aggregate_layers=None,
                              feature_dir: str | None = None,
                              image_id: str | None = None,
-                             bank_cache_dir: str | None = None):
+                             bank_cache_dir: str | None = None,
+                             context_radius: int = 0):
     """
     Build positive/negative patch banks from Image A using SH_2022 labels.
 
@@ -31,13 +42,14 @@ def build_banks_single_scale(img_a: np.ndarray,
 
     if bank_cache_dir is not None and image_id is not None:
         os.makedirs(bank_cache_dir, exist_ok=True)
-        pos_cache_path = os.path.join(bank_cache_dir, f"{image_id}_pos_bank.npy")
-        neg_cache_path = os.path.join(bank_cache_dir, f"{image_id}_neg_bank.npy")
+        cache_tag = f"{image_id}_ps{ps}_ctx{int(context_radius)}"
+        pos_cache_path = os.path.join(bank_cache_dir, f"{cache_tag}_pos_bank.npy")
+        neg_cache_path = os.path.join(bank_cache_dir, f"{cache_tag}_neg_bank.npy")
         if os.path.exists(pos_cache_path):
             pos_bank = np.load(pos_cache_path)
             neg_bank = np.load(neg_cache_path) if os.path.exists(neg_cache_path) else None
             time_end("build_banks_single_scale(load_cache)", t0)
-            print(f"[cache] loaded banks from {bank_cache_dir}")
+            logger.info("loaded banks from %s", bank_cache_dir)
             return pos_bank, neg_bank
 
     pos_list, neg_list = [], []
@@ -67,6 +79,8 @@ def build_banks_single_scale(img_a: np.ndarray,
             computed_tiles += 1
             if feature_dir is not None and image_id is not None:
                 save_tile_features(feats_tile, feature_dir, image_id, y, x)
+        if context_radius and context_radius > 0:
+            feats_tile = add_local_context_mean(feats_tile, context_radius)
 
         pos_mask, neg_mask = labels_to_patch_masks(lab_c, hp, wp, pos_frac_thresh=pos_frac_thresh)
         pos_feats_tile = feats_tile[pos_mask]
@@ -82,26 +96,27 @@ def build_banks_single_scale(img_a: np.ndarray,
     pos_bank = np.concatenate(pos_list, axis=0)
     neg_bank = np.concatenate(neg_list, axis=0) if neg_list else None
 
-    print(f"Positive bank size: {len(pos_bank)} patches")
+    logger.info("Positive bank size: %s patches", len(pos_bank))
     if neg_bank is not None:
         max_neg = getattr(cfg, "MAX_NEG_BANK", 8000)
-        print(f"Negative bank size: {len(neg_bank)} patches")
+        logger.info("Negative bank size: %s patches", len(neg_bank))
         if len(neg_bank) > max_neg:
             rng = np.random.default_rng(42)
             idx = rng.choice(len(neg_bank), size=max_neg, replace=False)
             neg_bank = neg_bank[idx]
-            print(f"[info] subsampled negative bank to {len(neg_bank)} (MAX_NEG_BANK={max_neg})")
+            logger.info("subsampled negative bank to %s (MAX_NEG_BANK=%s)", len(neg_bank), max_neg)
 
     time_end("build_banks_single_scale", t0)
-    print(f"[cache] A: cached tiles={cached_tiles}, computed tiles={computed_tiles}")
+    logger.info("A: cached tiles=%s, computed tiles=%s", cached_tiles, computed_tiles)
 
     if bank_cache_dir is not None and image_id is not None:
         os.makedirs(bank_cache_dir, exist_ok=True)
-        pos_cache_path = os.path.join(bank_cache_dir, f"{image_id}_pos_bank.npy")
-        neg_cache_path = os.path.join(bank_cache_dir, f"{image_id}_neg_bank.npy")
+        cache_tag = f"{image_id}_ps{ps}_ctx{int(context_radius)}"
+        pos_cache_path = os.path.join(bank_cache_dir, f"{cache_tag}_pos_bank.npy")
+        neg_cache_path = os.path.join(bank_cache_dir, f"{cache_tag}_neg_bank.npy")
         np.save(pos_cache_path, pos_bank.astype(np.float32))
         if neg_bank is not None:
             np.save(neg_cache_path, neg_bank.astype(np.float32))
-        print(f"[cache] saved banks to {bank_cache_dir}")
+        logger.info("saved banks to %s", bank_cache_dir)
 
     return pos_bank, neg_bank

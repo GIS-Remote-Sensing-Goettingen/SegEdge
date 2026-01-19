@@ -1,7 +1,9 @@
 import os
+import logging
 import numpy as np
 import matplotlib.pyplot as plt
 
+logger = logging.getLogger(__name__)
 
 def save_plot(img_b, gt_mask_B, mask_raw_best, best_raw_config, best_crf_mask, best_crf_config, thr_center_for_crf, plot_dir, image_id_b, best_shadow=None):
     """Save comparison figure (RGB, GT, raw, CRF, optional shadow) to plot_dir."""
@@ -55,7 +57,7 @@ def save_plot(img_b, gt_mask_B, mask_raw_best, best_raw_config, best_crf_mask, b
     plot_path = os.path.join(plot_dir, f"{image_id_b}_raw_crf.png")
     fig.savefig(plot_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"[plot] saved to {plot_path}")
+    logger.info("plot saved to %s", plot_path)
 
 
 def save_best_model_plot(img_b, gt_mask, pred_mask, title, plot_dir, image_id_b, filename_suffix="champion.png"):
@@ -80,7 +82,7 @@ def save_best_model_plot(img_b, gt_mask, pred_mask, title, plot_dir, image_id_b,
     plot_path = os.path.join(plot_dir, f"{image_id_b}_{filename_suffix}")
     fig.savefig(plot_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"[plot] saved champion overlay to {plot_path}")
+    logger.info("plot saved champion overlay to %s", plot_path)
 
 
 def save_knn_xgb_gt_plot(img_b,
@@ -127,4 +129,4 @@ def save_knn_xgb_gt_plot(img_b,
     plot_path = os.path.join(plot_dir, f"{image_id_b}_{filename_suffix}")
     fig.savefig(plot_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"[plot] saved kNN/XGB/GT overlay to {plot_path}")
+    logger.info("plot saved kNN/XGB/GT overlay to %s", plot_path)

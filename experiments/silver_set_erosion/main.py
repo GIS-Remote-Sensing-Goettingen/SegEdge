@@ -2,6 +2,7 @@
 # Orchestrator for the DINOv3 zero-shot pipeline (kNN + CRF).
 
 import os
+import logging
 import numpy as np
 import torch
 from skimage.transform import resize
@@ -34,11 +35,14 @@ from crf_utils import crf_grid_search
 from plotting import save_plot, save_best_model_plot, save_knn_xgb_gt_plot
 from transformers import AutoImageProcessor, AutoModel
 from shadow_filter import shadow_filter_grid
+from logging_utils import setup_logging
 
 
 # Config-driven flags
 USE_FP16_KNN = getattr(cfg, "USE_FP16_KNN", True)
 CRF_MAX_CONFIGS = getattr(cfg, "CRF_MAX_CONFIGS", 64)
+
+logger = logging.getLogger(__name__)
 
 
 def init_model(model_name: str):
@@ -64,6 +68,7 @@ def main():
          • Export diagnostics + shapefiles
     """
 
+    setup_logging(getattr(cfg, "LOG_PATH", None))
     t0_main = time_start()
     model_name = cfg.MODEL_NAME
 
@@ -78,23 +83,27 @@ def main():
     # ------------------------------------------------------------
     # Resolve paths to imagery + SH_2022 + GT vector labels
     # ------------------------------------------------------------
-    img_path = cfg.IMG_PATH
+    img_path_default = cfg.IMG_PATH
     img2_path = cfg.IMG2_PATH
     lab_path = cfg.LAB_PATH
-    gt_vector_path = cfg.GT_VECTOR_PATH
+    gt_vector_paths = getattr(cfg, "GT_VECTOR_PATHS", None) or cfg.GT_VECTOR_PATH
 
     # ------------------------------------------------------------
-    # Load imagery and reproject labels
+    # Resolve one or more labeled source images (Image A list)
+    # ------------------------------------------------------------
+    img_a_paths = getattr(cfg, "IMG_A_PATHS", None) or [img_path_default]
+    lab_a_paths = getattr(cfg, "LAB_A_PATHS", None)
+    if lab_a_paths is None:
+        lab_a_paths = [lab_path] * len(img_a_paths)
+    if len(lab_a_paths) != len(img_a_paths):
+        raise ValueError("LAB_A_PATHS must be None or have the same length as IMG_A_PATHS")
+
+    context_radius = int(getattr(cfg, "FEAT_CONTEXT_RADIUS", 0) or 0)
+
+    # ------------------------------------------------------------
+    # Load imagery and reproject labels (Image B + SH + GT)
     # ------------------------------------------------------------
     t0_data = time_start()
-    img = load_dop20_image(
-        img_path        # source path for DOP20 orthophoto A (bank image)
-    )
-    labels_A = reproject_labels_to_image(
-        img_path,       # image A path (target CRS/grid)
-        lab_path        # SH_2022 raster to reproject
-    )
-
     img_b = load_dop20_image(
         img2_path       # target image B for inference
     )
@@ -104,13 +113,13 @@ def main():
     )
 
     gt_mask_B = rasterize_vector_labels(
-        gt_vector_path, # vector ground truth polygons for B
-        img2_path       # raster reference to match CRS/resolution
+        gt_vector_paths, # vector ground truth polygon(s) for B (union-merged if list)
+        img2_path        # raster reference to match CRS/resolution
     )
     time_end("data_loading_and_reprojection", t0_data)
 
-    print(f"[debug] GT positives on B: {gt_mask_B.sum()}")
-    print(f"[debug] SH_2022 positives on B: {(labels_SH_B > 0).sum()}")
+    logger.debug("GT positives on B: %s", gt_mask_B.sum())
+    logger.debug("SH_2022 positives on B: %s", (labels_SH_B > 0).sum())
 
     # ------------------------------------------------------------
     # Build SH_2022 buffer (spatial prior)
@@ -120,7 +129,7 @@ def main():
 
     buffer_m = cfg.BUFFER_M
     buffer_pixels = int(round(buffer_m / pixel_size_m))
-    print(f"[info] pixel_size={pixel_size_m:.3f} m, buffer_m={buffer_m}, buffer_pixels={buffer_pixels}")
+    logger.info("pixel_size=%.3f m, buffer_m=%s, buffer_pixels=%s", pixel_size_m, buffer_m, buffer_pixels)
 
     sh_buffer_mask_B = build_sh_buffer_mask(
         labels_SH_B,    # SH_2022 label raster on B
@@ -129,7 +138,7 @@ def main():
 
     if getattr(cfg, "CLIP_GT_TO_BUFFER", False):
         gt_mask_eval = np.logical_and(gt_mask_B, sh_buffer_mask_B)
-        print(f"[info] CLIP_GT_TO_BUFFER enabled: GT positives -> {gt_mask_eval.sum()} (was {gt_mask_B.sum()})")
+        logger.info("CLIP_GT_TO_BUFFER enabled: GT positives -> %s (was %s)", gt_mask_eval.sum(), gt_mask_B.sum())
     else:
         gt_mask_eval = gt_mask_B
 
@@ -144,27 +153,42 @@ def main():
     feature_dir = cfg.FEATURE_DIR
     os.makedirs(feature_dir, exist_ok=True)
 
-    image_id_a = os.path.splitext(os.path.basename(img_path))[0]
+    image_id_a_list = [os.path.splitext(os.path.basename(p))[0] for p in img_a_paths]
     image_id_b = os.path.splitext(os.path.basename(img2_path))[0]
 
     # ------------------------------------------------------------
-    # Build DINOv3 positive/negative banks on Image A
+    # Build DINOv3 positive/negative banks from one or more Image A sources
     # ------------------------------------------------------------
-    pos_bank, neg_bank = build_banks_single_scale(
-        img,                    # img_a: RGB array of image A
-        labels_A,               # labels_a: SH_2022 labels on A
-        model,                  # DINO model for patch embeddings
-        processor,              # processor for preprocessing
-        device,                 # GPU/CPU device
-        ps,                     # ps: ViT patch size
-        tile_size,              # tile_size: patch extraction block
-        stride,                 # stride: tile overlap
-        getattr(cfg, "POS_FRAC_THRESH", 0.1),  # pos_frac_thresh: fraction of FG per patch
-        None,                   # aggregate_layers: None → default layer
-        feature_dir,            # feature_dir: store tile-level embeddings
-        image_id_a,             # unique ID for caching A’s tiles
-        cfg.BANK_CACHE_DIR      # bank cache directory (reuses banks)
-    )
+    pos_banks = []
+    neg_banks = []
+    for img_a_path, lab_a_path, image_id_a in zip(img_a_paths, lab_a_paths, image_id_a_list, strict=True):
+        logger.info("source A: %s (labels: %s)", img_a_path, lab_a_path)
+        img_a = load_dop20_image(img_a_path)
+        labels_A = reproject_labels_to_image(img_a_path, lab_a_path)
+
+        pos_bank_i, neg_bank_i = build_banks_single_scale(
+            img_a,                    # img_a: RGB array
+            labels_A,                 # SH labels on A (reprojected)
+            model,                    # DINO model
+            processor,                # processor
+            device,                   # GPU/CPU device
+            ps,                       # patch size
+            tile_size,                # tiling
+            stride,                   # overlap
+            getattr(cfg, "POS_FRAC_THRESH", 0.1),
+            None,
+            feature_dir,
+            image_id_a,
+            cfg.BANK_CACHE_DIR,
+            context_radius=context_radius,
+        )
+        pos_banks.append(pos_bank_i)
+        if neg_bank_i is not None and len(neg_bank_i) > 0:
+            neg_banks.append(neg_bank_i)
+
+    pos_bank = np.concatenate(pos_banks, axis=0)
+    neg_bank = np.concatenate(neg_banks, axis=0) if neg_banks else None
+    logger.info("combined banks: pos=%s, neg=%s", len(pos_bank), 0 if neg_bank is None else len(neg_bank))
 
     # ------------------------------------------------------------
     # Prefetch DINO features for Image B (so kNN grid search is fast)
@@ -202,7 +226,8 @@ def main():
         sh_buffer_mask_B,      # spatial prior mask
         gt_mask_eval,          # ground-truth for scoring
         prefetched_b,          # cached DINO features for B
-        USE_FP16_KNN           # use half precision matmul for speed
+        USE_FP16_KNN,          # use half precision matmul for speed
+        context_radius=context_radius,
     )
 
     # ------------------------------------------------------------
@@ -243,17 +268,27 @@ def main():
     # ------------------------------------------------------------
     # XGBoost branch (patch-level classifier)
     # ------------------------------------------------------------
-    X, y = build_xgb_dataset(
-        img,
-        labels_A,
-        ps,
-        tile_size,
-        stride,
-        feature_dir,
-        image_id_a,
-        pos_frac=cfg.POS_FRAC_THRESH,
-        max_neg=getattr(cfg, "MAX_NEG_BANK", 8000),
-    )
+    X_list = []
+    y_list = []
+    for img_a_path, lab_a_path, image_id_a in zip(img_a_paths, lab_a_paths, image_id_a_list, strict=True):
+        img_a = load_dop20_image(img_a_path)
+        labels_A = reproject_labels_to_image(img_a_path, lab_a_path)
+        X_i, y_i = build_xgb_dataset(
+            img_a,
+            labels_A,
+            ps,
+            tile_size,
+            stride,
+            feature_dir,
+            image_id_a,
+            pos_frac=cfg.POS_FRAC_THRESH,
+            max_neg=getattr(cfg, "MAX_NEG_BANK", 8000),
+            context_radius=context_radius,
+        )
+        X_list.append(X_i)
+        y_list.append(y_i)
+    X = np.vstack(X_list) if X_list else np.empty((0, 0), dtype=np.float32)
+    y = np.concatenate(y_list) if y_list else np.empty((0,), dtype=np.float32)
 
     use_gpu_xgb = getattr(cfg, "XGB_USE_GPU", True)
     param_grid = getattr(cfg, "XGB_PARAM_GRID", None)
@@ -284,6 +319,7 @@ def main():
             early_stopping_rounds=early_stop,
             verbose_eval=verbose_eval,
             seed=42,
+            context_radius=context_radius,
         )
         best_xgb = best_metrics_xgb
         best_xgb_config = {
@@ -293,12 +329,22 @@ def main():
             **best_xgb,
             "params": best_params_xgb,
         }
-        score_full_xgb = xgb_score_image_b(img_b, bst, ps, tile_size, stride, feature_dir, image_id_b, prefetched_tiles=prefetched_b)
+        score_full_xgb = xgb_score_image_b(
+            img_b,
+            bst,
+            ps,
+            tile_size,
+            stride,
+            feature_dir,
+            image_id_b,
+            prefetched_tiles=prefetched_b,
+            context_radius=context_radius,
+        )
         mask_xgb = (score_full_xgb >= best_thr_xgb) & sh_buffer_mask_B
         mask_xgb = median_filter(mask_xgb.astype(np.uint8), size=3) > 0
         metrics_xgb_filtered = compute_metrics(mask_xgb, gt_mask_eval)
         best_xgb_config = {**best_xgb_config, **metrics_xgb_filtered}
-        print(f"[xgb-best] thr={best_thr_xgb:.3f}, IoU={best_xgb_config['iou']:.3f}, F1={best_xgb_config['f1']:.3f}")
+        logger.info("xgb-best thr=%.3f, IoU=%.3f, F1=%.3f", best_thr_xgb, best_xgb_config["iou"], best_xgb_config["f1"])
     else:
         bst = train_xgb_classifier(
             X,
@@ -308,7 +354,17 @@ def main():
             verbose_eval=verbose_eval,
         )
         best_params_xgb = None
-        score_full_xgb = xgb_score_image_b(img_b, bst, ps, tile_size, stride, feature_dir, image_id_b, prefetched_tiles=prefetched_b)
+        score_full_xgb = xgb_score_image_b(
+            img_b,
+            bst,
+            ps,
+            tile_size,
+            stride,
+            feature_dir,
+            image_id_b,
+            prefetched_tiles=prefetched_b,
+            context_radius=context_radius,
+        )
         try:
             metrics_list = compute_metrics_batch_gpu(score_full_xgb, cfg.THRESHOLDS, sh_buffer_mask_B, gt_mask_eval, device=device)
         except torch.cuda.OutOfMemoryError:
@@ -325,7 +381,7 @@ def main():
             **metrics_xgb_filtered,
             "params": best_params_xgb,
         }
-        print(f"[xgb-best] thr={best_xgb['threshold']:.3f}, IoU={best_xgb_config['iou']:.3f}, F1={best_xgb_config['f1']:.3f}")
+        logger.info("xgb-best thr=%.3f, IoU=%.3f, F1=%.3f", best_xgb["threshold"], best_xgb_config["iou"], best_xgb_config["f1"])
 
     # Champion selection: choose better of kNN or XGB for CRF
     if best_xgb_config["iou"] > champion_config["iou"]:
@@ -406,11 +462,12 @@ def main():
             best_crf_mask,      # upsampled CRF mask
             gt_mask_eval        # GT
         )
-        print(
-            f"[crf-upsampled] IoU={metrics_crf_full['iou']:.3f}, "
-            f"F1={metrics_crf_full['f1']:.3f}, "
-            f"P={metrics_crf_full['precision']:.3f}, "
-            f"R={metrics_crf_full['recall']:.3f}"
+        logger.info(
+            "crf-upsampled IoU=%.3f, F1=%.3f, P=%.3f, R=%.3f",
+            metrics_crf_full["iou"],
+            metrics_crf_full["f1"],
+            metrics_crf_full["precision"],
+            metrics_crf_full["recall"],
         )
 
     # ------------------------------------------------------------
@@ -466,10 +523,8 @@ def main():
     # ------------------------------------------------------------
     # Consolidate tile-level feature files (.npy) → one per image
     # ------------------------------------------------------------
-    consolidate_features_for_image(
-        feature_dir,        # directory containing tile features
-        image_id_a          # ID for image A
-    )
+    for image_id_a in image_id_a_list:
+        consolidate_features_for_image(feature_dir, image_id_a)
     consolidate_features_for_image(
         feature_dir,
         image_id_b          # ID for image B
@@ -482,7 +537,7 @@ def main():
         best_raw_config,    # raw pipeline config
         best_crf_config,    # CRF config
         model_name,         # DINO model name
-        img_path,           # path to A
+        img_a_paths,        # path(s) to A
         img2_path,          # path to B
         buffer_m,           # SH buffer in meters
         pixel_size_m,       # pixel spacing in meters
@@ -491,6 +546,7 @@ def main():
             "tile_size": tile_size,
             "stride": stride,
             "patch_size": ps,
+            "feat_context_radius": context_radius,
             "neg_alpha": getattr(cfg, "NEG_ALPHA", 1.0),
             "pos_frac_thresh": getattr(cfg, "POS_FRAC_THRESH", 0.1),
         },

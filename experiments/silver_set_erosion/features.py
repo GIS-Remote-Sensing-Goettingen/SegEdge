@@ -1,12 +1,15 @@
 import os
 import time
+import logging
 
 import numpy as np
 import torch
 from skimage.transform import resize
+from scipy.ndimage import uniform_filter
 
 from timing_utils import time_start, time_end, DEBUG_TIMING, DEBUG_TIMING_VERBOSE
 
+logger = logging.getLogger(__name__)
 
 def l2_normalize(feats: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     """L2-normalize feature vectors along the last dimension."""
@@ -16,6 +19,23 @@ def l2_normalize(feats: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     if DEBUG_TIMING and DEBUG_TIMING_VERBOSE:
         time_end("l2_normalize", t0)
     return out
+
+
+def add_local_context_mean(feats_hwc: np.ndarray, radius: int) -> np.ndarray:
+    """
+    Add local spatial context to patch embeddings by averaging over a (2r+1)x(2r+1) neighborhood.
+
+    - Operates on patch-grid features (Hp x Wp x C), not pixel space.
+    - Does not mix channels (filter size is (k, k, 1)).
+    """
+    if radius <= 0:
+        return feats_hwc
+    if feats_hwc.ndim != 3:
+        raise ValueError(f"expected feats with shape (Hp, Wp, C), got {feats_hwc.shape}")
+    k = 2 * int(radius) + 1
+    feats = feats_hwc.astype(np.float32, copy=False)
+    feats_ctx = uniform_filter(feats, size=(k, k, 1), mode="reflect")
+    return l2_normalize(feats_ctx)
 
 
 def tile_iterator(image_hw3: np.ndarray,
@@ -169,5 +189,5 @@ def prefetch_features_single_scale_image(
                 save_tile_features(feats_tile, feature_dir, image_id, y, x)
         cache[(y, x)] = {"feats": feats_tile, "h_eff": h_eff, "w_eff": w_eff, "hp": hp, "wp": wp}
     time_end("prefetch_features_single_scale_image", t0)
-    print(f"[prefetch] tiles={len(cache)} (cached={cached_tiles}, computed={computed_tiles}, skipped={skipped_tiles})")
+    logger.info("prefetch tiles=%s (cached=%s, computed=%s, skipped=%s)", len(cache), cached_tiles, computed_tiles, skipped_tiles)
     return cache

@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import logging
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
 from skimage.transform import resize
@@ -38,7 +39,10 @@ from main import (
     export_mask_to_shapefile,
     consolidate_features_for_image,
 )
+import config as cfg
+from logging_utils import setup_logging
 
+logger = logging.getLogger(__name__)
 
 # -------------------------------------------------------------
 # helpers
@@ -109,7 +113,7 @@ def build_train_tiles_with_labels(img_a: np.ndarray,
         targets.append(label_grid)
 
     time_end("build_train_tiles_with_labels", t0)
-    print(f"[train-tiles] count={len(inputs_rgb)} cached={cached_tiles} computed={computed_tiles}")
+    logger.info("train-tiles count=%s cached=%s computed=%s", len(inputs_rgb), cached_tiles, computed_tiles)
     return inputs_dino, inputs_rgb, targets
 
 
@@ -204,7 +208,7 @@ def train_cnn_head(train_inputs_dino,
     scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
 
     model.train()
-    print(f"[cnn] Training on {len(ds)} tiles...")
+    logger.info("cnn training on %s tiles...", len(ds))
     for ep in range(epochs):
         ep_loss = 0.0
         count = 0
@@ -231,7 +235,7 @@ def train_cnn_head(train_inputs_dino,
             scaler.update()
             ep_loss += loss.item()
             count += 1
-        print(f"[cnn] epoch {ep+1}/{epochs} loss={ep_loss / max(1, count):.4f}")
+        logger.info("cnn epoch %s/%s loss=%.4f", ep + 1, epochs, ep_loss / max(1, count))
 
     time_end("train_cnn_head", t0)
     model.eval()
@@ -317,6 +321,7 @@ def grid_search_thresholds(score_map: np.ndarray,
 
 
 def main():
+    setup_logging(getattr(cfg, "LOG_PATH", None))
     t0_main = time_start()
     model_name = "facebook/dinov3-vitl16-pretrain-sat493m"
     dino_model, processor, device = init_model(model_name)
@@ -400,7 +405,7 @@ def main():
                                           device=device)
     thr_best = best_thr_cfg["threshold"]
     mask_raw_best = np.logical_and(score_full >= thr_best, sh_buffer_mask_B)
-    print(f"[best-raw-cnn] thr={thr_best:.3f}, IoU={best_thr_cfg['iou']:.3f}, F1={best_thr_cfg['f1']:.3f}")
+    logger.info("best-raw-cnn thr=%.3f, IoU=%.3f, F1=%.3f", thr_best, best_thr_cfg["iou"], best_thr_cfg["f1"])
 
     # CRF
     PROB_SOFTNESS_VALUES = [0.05]
@@ -437,8 +442,7 @@ def main():
             anti_aliasing=False,
         ) > 0.5
     best_crf_config = {"threshold": thr_best, **best_crf_cfg_inner}
-    print("\n[crf-cnn] best config:")
-    print(best_crf_config)
+    logger.info("crf-cnn best config: %s", best_crf_config)
 
     # Visualization
     fig, axs = plt.subplots(2, 3, figsize=(24, 12))

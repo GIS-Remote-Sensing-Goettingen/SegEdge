@@ -1,9 +1,11 @@
 import time
+import logging
 
 import numpy as np
 import torch
 from timing_utils import time_start, time_end, DEBUG_TIMING, DEBUG_TIMING_VERBOSE
 
+logger = logging.getLogger(__name__)
 
 def compute_metrics(pred_mask: np.ndarray, gt_mask: np.ndarray) -> dict:
     """Compute precision/recall/IoU/F1 and confusion counts for binary masks."""
@@ -124,10 +126,12 @@ def compute_oracle_upper_bound(gt_mask: np.ndarray,
     t0 = time_start()
     oracle_mask = np.logical_and(gt_mask.astype(bool), sh_mask.astype(bool))
     metrics = compute_metrics(oracle_mask, gt_mask)
-    print(
-        "[oracle] SH buffer upper bound -> "
-        f"IoU={metrics['iou']:.3f}, F1={metrics['f1']:.3f}, "
-        f"P={metrics['precision']:.3f}, R={metrics['recall']:.3f}"
+    logger.info(
+        "oracle SH buffer upper bound -> IoU=%.3f, F1=%.3f, P=%.3f, R=%.3f",
+        metrics["iou"],
+        metrics["f1"],
+        metrics["precision"],
+        metrics["recall"],
     )
     time_end("oracle_upper_bound_SH_buffer", t0)
     return metrics

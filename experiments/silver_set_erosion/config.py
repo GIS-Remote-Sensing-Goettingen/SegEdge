@@ -2,27 +2,50 @@
 # Adjust these paths/hyperparameters as needed; main.py will import them.
 
 # Paths
-IMG_PATH = "data/dop20_593000_5979000_1km_20cm.tif"          # Image A
+IMG_PATH = "data/tiles/dop20_596000_5974000_1km_20cm.tif"    # Image A (fallback)
 IMG2_PATH = "data/dop20_592000_5982000_1km_20cm.tif"         # Image B
-LAB_PATH = "data/planet_labels_2022.tif"                     # SH_2022 raster
-GT_VECTOR_PATH = "data/labels_final.shp"                     # Ground truth for B
+LAB_PATH = "data/lables/planet_labels_2022.tif"              # SH_2022 raster
+# Ground truth for B (evaluation). If GT_VECTOR_PATHS is provided, they will be union-merged.
+GT_VECTOR_PATH = "data/lables/labels_final.shp"
+GT_VECTOR_PATHS = [
+    "data/lables/lables_1.shp",
+    "data/lables/lables_2.shp",
+    "data/lables/lables_3.shp",
+]
 FEATURE_DIR = "data/dino_features"
 BANK_CACHE_DIR = "data/dino_features/banks"
 PLOT_DIR = "data/plots"
 BEST_SETTINGS_PATH = "data/plots/best_settings.yml"
+LOG_PATH = "data/plots/run.log"
+
+# Optional: multiple labeled source images (Image A list) to build larger banks / XGB training data.
+# If set, the pipeline will iterate over these paths and concatenate their banks.
+# LAB_PATH is used for all sources unless you provide per-source label rasters via LAB_A_PATHS.
+IMG_A_PATHS = [
+    "data/tiles/dop20_596000_5974000_1km_20cm.tif",
+    "data/tiles/dop20_596000_5975000_1km_20cm.tif",
+    "data/tiles/dop20_596000_5976000_1km_20cm.tif",
+    "data/tiles/dop20_596000_5977000_1km_20cm.tif",
+    "data/tiles/dop20_596000_5983000_1km_20cm.tif",
+]
+LAB_A_PATHS = None  # e.g. ["data/a1_labels.tif", "data/a2_labels.tif"] (must match IMG_A_PATHS length)
 
 # Model / buffers
 MODEL_NAME = "facebook/dinov3-vitl16-pretrain-sat493m"
 BUFFER_M = 8.0
 TILE_SIZE = 1024
 STRIDE = 512
-PATCH_SIZE = 16  # DINO patch size
+PATCH_SIZE = 16  # DINO patch
 NEG_ALPHA = 1.0  # kNN negative bank weight
 POS_FRAC_THRESH = 0.1  # fraction for positive patch labeling in A
 
+# Optional: add local context to patch embeddings by averaging over a (2r+1)x(2r+1) patch neighborhood.
+# This affects bank building, kNN scoring, and XGB training/scoring (features are still cached raw on disk).
+FEAT_CONTEXT_RADIUS = 0  # 0 disables; try 1 or 2 for more context
+
 # Grid search
 #K_VALUES = [1, 2, 3, 5, 7, 10, 15, 20, 25, 30, 45, 50, 75, 100 ,150, 200, 300, 500]
-K_VALUES = [200]
+K_VALUES = [175,200,250]
 THRESHOLDS = [float(x) for x in __import__("numpy").linspace(0.01, 0.9, 100)]
 
 # CRF search
@@ -70,5 +93,3 @@ XGB_PARAM_GRID = [
     # Sometimes slightly higher alpha (0.1) helps clean up noisy borders.
     {"max_depth": 6, "eta": 0.05, "colsample_bytree": 0.3, "subsample": 0.9, "reg_alpha": 0.1,  "min_child_weight": 1},
 ]
-
-
