@@ -411,7 +411,7 @@ def main():
     os.makedirs(feature_dir, exist_ok=True)
 
     val_b_path = getattr(cfg, "VAL_TILE", None) or cfg.TARGET_TILE
-    gt_paths = getattr(cfg, "EVAL_GT_VECTORS", None) or cfg.EVAL_GT_VECTOR
+    gt_paths = cfg.EVAL_GT_VECTORS
 
     holdout_b_paths = getattr(cfg, "HOLDOUT_TILES", None)
     if not holdout_b_paths:

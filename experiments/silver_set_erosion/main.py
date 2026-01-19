@@ -29,10 +29,10 @@ from io_utils import (
 )
 from features import prefetch_features_single_scale_image
 from banks import build_banks_single_scale
-from knn import grid_search_k_threshold, fine_tune_threshold
+from knn import grid_search_k_threshold, fine_tune_threshold, zero_shot_knn_single_scale_B_with_saliency
 from metrics_utils import compute_oracle_upper_bound, compute_metrics, compute_metrics_batch_cpu, \
     compute_metrics_batch_gpu
-from crf_utils import crf_grid_search
+from crf_utils import crf_grid_search, refine_with_densecrf
 from plotting import save_plot, save_best_model_plot, save_knn_xgb_gt_plot
 from transformers import AutoImageProcessor, AutoModel
 from shadow_filter import shadow_filter_grid
@@ -58,9 +58,36 @@ def init_model(model_name: str):
     return model, processor, device
 
 
-def process_b_tile(
-    img2_path: str,
-    gt_vector_paths,
+def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
+    """Load B tile, SH raster, GT (optional), and buffer mask."""
+    t0_data = time_start()
+    img_b = load_dop20_image(img_path)
+    labels_sh = reproject_labels_to_image(img_path, cfg.SOURCE_LABEL_RASTER)
+    gt_mask = rasterize_vector_labels(gt_vector_paths, img_path) if gt_vector_paths else None
+    time_end("data_loading_and_reprojection", t0_data)
+
+    if gt_mask is not None:
+        logger.debug("GT positives on B: %s", gt_mask.sum())
+    logger.debug("SH_2022 positives on B: %s", (labels_sh > 0).sum())
+
+    with __import__("rasterio").open(img_path) as src:
+        pixel_size_m = abs(src.transform.a)
+    buffer_m = cfg.BUFFER_M
+    buffer_pixels = int(round(buffer_m / pixel_size_m))
+    logger.info("pixel_size=%.3f m, buffer_m=%s, buffer_pixels=%s", pixel_size_m, buffer_m, buffer_pixels)
+
+    sh_buffer_mask = build_sh_buffer_mask(labels_sh, buffer_pixels)
+    if gt_mask is not None and getattr(cfg, "CLIP_GT_TO_BUFFER", False):
+        gt_mask_eval = np.logical_and(gt_mask, sh_buffer_mask)
+        logger.info("CLIP_GT_TO_BUFFER enabled: GT positives -> %s (was %s)", gt_mask_eval.sum(), gt_mask.sum())
+    else:
+        gt_mask_eval = gt_mask
+    return img_b, labels_sh, gt_mask, gt_mask_eval, sh_buffer_mask, buffer_m, pixel_size_m
+
+
+def tune_on_validation_multi(
+    val_paths: list[str],
+    gt_vector_paths: list[str],
     model,
     processor,
     device,
@@ -72,53 +99,354 @@ def process_b_tile(
     tile_size: int,
     stride: int,
     feature_dir: str,
+    context_radius: int,
+):
+    """Tune hyperparameters using median IoU across validation tiles."""
+    if not val_paths:
+        raise ValueError("VAL_TILES is empty.")
+
+    val_contexts = []
+    for val_path in val_paths:
+        img_b, labels_sh, gt_mask_B, gt_mask_eval, sh_buffer_mask, buffer_m, pixel_size_m = load_b_tile_context(
+            val_path, gt_vector_paths
+        )
+        if gt_mask_eval is None:
+            raise ValueError("Validation requires GT vectors for metric-based tuning.")
+        _ = compute_oracle_upper_bound(gt_mask_eval, sh_buffer_mask)
+        image_id_b = os.path.splitext(os.path.basename(val_path))[0]
+        prefetched_b = prefetch_features_single_scale_image(
+            img_b, model, processor, device, ps, tile_size, stride, None, feature_dir, image_id_b
+        )
+        val_contexts.append(
+            {
+                "path": val_path,
+                "image_id": image_id_b,
+                "img_b": img_b,
+                "labels_sh": labels_sh,
+                "gt_mask_B": gt_mask_B,
+                "gt_mask_eval": gt_mask_eval,
+                "sh_buffer_mask": sh_buffer_mask,
+                "prefetched_b": prefetched_b,
+                "buffer_m": buffer_m,
+                "pixel_size_m": pixel_size_m,
+            }
+        )
+
+    # kNN tuning (median IoU across val tiles)
+    best_raw_config = None
+    for k in cfg.K_VALUES:
+        iou_by_thr = {thr: [] for thr in cfg.THRESHOLDS}
+        for ctx in val_contexts:
+            score_full, _ = zero_shot_knn_single_scale_B_with_saliency(
+                img_b=ctx["img_b"],
+                pos_bank=pos_bank,
+                neg_bank=neg_bank,
+                model=model,
+                processor=processor,
+                device=device,
+                ps=ps,
+                tile_size=tile_size,
+                stride=stride,
+                k=k,
+                aggregate_layers=None,
+                feature_dir=feature_dir,
+                image_id=ctx["image_id"],
+                neg_alpha=getattr(cfg, "NEG_ALPHA", 1.0),
+                prefetched_tiles=ctx["prefetched_b"],
+                use_fp16_matmul=USE_FP16_KNN,
+                context_radius=context_radius,
+            )
+            try:
+                metrics_list = compute_metrics_batch_gpu(
+                    score_full, cfg.THRESHOLDS, ctx["sh_buffer_mask"], ctx["gt_mask_eval"], device=device
+                )
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                metrics_list = compute_metrics_batch_cpu(
+                    score_full, cfg.THRESHOLDS, ctx["sh_buffer_mask"], ctx["gt_mask_eval"]
+                )
+            for m in metrics_list:
+                iou_by_thr[m["threshold"]].append(m["iou"])
+
+        for thr, ious in iou_by_thr.items():
+            med_iou = float(np.median(ious))
+            if best_raw_config is None or med_iou > best_raw_config["iou"]:
+                best_raw_config = {"k": k, "threshold": thr, "source": "raw", "iou": med_iou}
+
+    # XGB tuning (median IoU across val tiles)
+    use_gpu_xgb = getattr(cfg, "XGB_USE_GPU", True)
+    param_grid = getattr(cfg, "XGB_PARAM_GRID", None)
+    num_boost_round = getattr(cfg, "XGB_NUM_BOOST_ROUND", 300)
+    early_stop = getattr(cfg, "XGB_EARLY_STOP", 40)
+    verbose_eval = getattr(cfg, "XGB_VERBOSE_EVAL", 50)
+    val_fraction = getattr(cfg, "XGB_VAL_FRACTION", 0.2)
+    if param_grid is None:
+        param_grid = [None]
+
+    best_xgb_config = None
+    best_bst = None
+    for overrides in param_grid:
+        if overrides is None:
+            bst = train_xgb_classifier(X, y, use_gpu=use_gpu_xgb, num_boost_round=num_boost_round, verbose_eval=verbose_eval)
+            params_used = None
+        else:
+            bst, params_used, _, _, _ = hyperparam_search_xgb_iou(
+                X,
+                y,
+                [0.5],
+                val_contexts[0]["sh_buffer_mask"],
+                val_contexts[0]["gt_mask_eval"],
+                val_contexts[0]["img_b"],
+                ps,
+                tile_size,
+                stride,
+                feature_dir,
+                val_contexts[0]["image_id"],
+                prefetched_tiles=val_contexts[0]["prefetched_b"],
+                device=device,
+                use_gpu=use_gpu_xgb,
+                param_grid=[overrides],
+                num_boost_round=num_boost_round,
+                val_fraction=val_fraction,
+                early_stopping_rounds=early_stop,
+                verbose_eval=verbose_eval,
+                seed=42,
+                context_radius=context_radius,
+            )
+
+        iou_by_thr = {thr: [] for thr in cfg.THRESHOLDS}
+        for ctx in val_contexts:
+            score_full = xgb_score_image_b(
+                ctx["img_b"],
+                bst,
+                ps,
+                tile_size,
+                stride,
+                feature_dir,
+                ctx["image_id"],
+                prefetched_tiles=ctx["prefetched_b"],
+                context_radius=context_radius,
+            )
+            try:
+                metrics_list = compute_metrics_batch_gpu(
+                    score_full, cfg.THRESHOLDS, ctx["sh_buffer_mask"], ctx["gt_mask_eval"], device=device
+                )
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                metrics_list = compute_metrics_batch_cpu(
+                    score_full, cfg.THRESHOLDS, ctx["sh_buffer_mask"], ctx["gt_mask_eval"]
+                )
+            for m in metrics_list:
+                iou_by_thr[m["threshold"]].append(m["iou"])
+
+        for thr, ious in iou_by_thr.items():
+            med_iou = float(np.median(ious))
+            cand = {"k": -1, "threshold": thr, "source": "xgb", "iou": med_iou, "params": params_used}
+            if best_xgb_config is None or med_iou > best_xgb_config["iou"]:
+                best_xgb_config = cand
+                best_bst = bst
+
+    champion_source = "raw" if best_raw_config["iou"] >= best_xgb_config["iou"] else "xgb"
+
+    # CRF tuning across val tiles
+    crf_candidates = [
+        (psf, pw, pxy, bw, bxy, brgb)
+        for psf in cfg.PROB_SOFTNESS_VALUES
+        for pw in cfg.POS_W_VALUES
+        for pxy in cfg.POS_XY_STD_VALUES
+        for bw in cfg.BILATERAL_W_VALUES
+        for bxy in cfg.BILATERAL_XY_STD_VALUES
+        for brgb in cfg.BILATERAL_RGB_STD_VALUES
+    ]
+    best_crf_cfg = None
+    best_crf_iou = None
+    for cand in crf_candidates[:CRF_MAX_CONFIGS]:
+        ious = []
+        for ctx in val_contexts:
+            if champion_source == "raw":
+                score_full, _ = zero_shot_knn_single_scale_B_with_saliency(
+                    img_b=ctx["img_b"],
+                    pos_bank=pos_bank,
+                    neg_bank=neg_bank,
+                    model=model,
+                    processor=processor,
+                    device=device,
+                    ps=ps,
+                    tile_size=tile_size,
+                    stride=stride,
+                    k=best_raw_config["k"],
+                    aggregate_layers=None,
+                    feature_dir=feature_dir,
+                    image_id=ctx["image_id"],
+                    neg_alpha=getattr(cfg, "NEG_ALPHA", 1.0),
+                    prefetched_tiles=ctx["prefetched_b"],
+                    use_fp16_matmul=USE_FP16_KNN,
+                    context_radius=context_radius,
+                )
+                thr_center = best_raw_config["threshold"]
+            else:
+                score_full = xgb_score_image_b(
+                    ctx["img_b"],
+                    best_bst,
+                    ps,
+                    tile_size,
+                    stride,
+                    feature_dir,
+                    ctx["image_id"],
+                    prefetched_tiles=ctx["prefetched_b"],
+                    context_radius=context_radius,
+                )
+                thr_center = best_xgb_config["threshold"]
+
+            mask_crf = refine_with_densecrf(
+                ctx["img_b"],
+                score_full,
+                thr_center,
+                ctx["sh_buffer_mask"],
+                prob_softness=cand[0],
+                n_iters=5,
+                pos_w=cand[1],
+                pos_xy_std=cand[2],
+                bilateral_w=cand[3],
+                bilateral_xy_std=cand[4],
+                bilateral_rgb_std=cand[5],
+            )
+            ious.append(compute_metrics(mask_crf, ctx["gt_mask_eval"])["iou"])
+
+        med_iou = float(np.median(ious))
+        if best_crf_iou is None or med_iou > best_crf_iou:
+            best_crf_iou = med_iou
+            best_crf_cfg = {
+                "prob_softness": cand[0],
+                "pos_w": cand[1],
+                "pos_xy_std": cand[2],
+                "bilateral_w": cand[3],
+                "bilateral_xy_std": cand[4],
+                "bilateral_rgb_std": cand[5],
+            }
+
+    # Shadow tuning across val tiles
+    best_shadow_cfg = None
+    best_shadow_iou = None
+    for weights in cfg.SHADOW_WEIGHT_SETS:
+        iou_by_thr = {thr: [] for thr in cfg.SHADOW_THRESHOLDS}
+        for ctx in val_contexts:
+            if champion_source == "raw":
+                score_full, _ = zero_shot_knn_single_scale_B_with_saliency(
+                    img_b=ctx["img_b"],
+                    pos_bank=pos_bank,
+                    neg_bank=neg_bank,
+                    model=model,
+                    processor=processor,
+                    device=device,
+                    ps=ps,
+                    tile_size=tile_size,
+                    stride=stride,
+                    k=best_raw_config["k"],
+                    aggregate_layers=None,
+                    feature_dir=feature_dir,
+                    image_id=ctx["image_id"],
+                    neg_alpha=getattr(cfg, "NEG_ALPHA", 1.0),
+                    prefetched_tiles=ctx["prefetched_b"],
+                    use_fp16_matmul=USE_FP16_KNN,
+                    context_radius=context_radius,
+                )
+                thr_center = best_raw_config["threshold"]
+            else:
+                score_full = xgb_score_image_b(
+                    ctx["img_b"],
+                    best_bst,
+                    ps,
+                    tile_size,
+                    stride,
+                    feature_dir,
+                    ctx["image_id"],
+                    prefetched_tiles=ctx["prefetched_b"],
+                    context_radius=context_radius,
+                )
+                thr_center = best_xgb_config["threshold"]
+
+            mask_crf = refine_with_densecrf(
+                ctx["img_b"],
+                score_full,
+                thr_center,
+                ctx["sh_buffer_mask"],
+                prob_softness=best_crf_cfg["prob_softness"],
+                n_iters=5,
+                pos_w=best_crf_cfg["pos_w"],
+                pos_xy_std=best_crf_cfg["pos_xy_std"],
+                bilateral_w=best_crf_cfg["bilateral_w"],
+                bilateral_xy_std=best_crf_cfg["bilateral_xy_std"],
+                bilateral_rgb_std=best_crf_cfg["bilateral_rgb_std"],
+            )
+            img_float = ctx["img_b"].astype(np.float32)
+            w = np.array(weights, dtype=np.float32).reshape(1, 1, 3)
+            wsum = (img_float * w).sum(axis=2)
+            flat_base = mask_crf.reshape(-1)
+            flat_gt = ctx["gt_mask_eval"].reshape(-1).astype(bool)
+            vals = wsum.reshape(-1)[flat_base]
+            gt_vals = flat_gt[flat_base]
+            if vals.size == 0:
+                continue
+            thr_arr = np.array(cfg.SHADOW_THRESHOLDS, dtype=np.float32).reshape(-1, 1)
+            mask_thr = vals[None, :] >= thr_arr
+            gt_bool = gt_vals.astype(bool)
+            tp = np.logical_and(mask_thr, gt_bool[None, :]).sum(axis=1).astype(np.float64)
+            fp = np.logical_and(mask_thr, ~gt_bool[None, :]).sum(axis=1).astype(np.float64)
+            fn = np.logical_and(~mask_thr, gt_bool[None, :]).sum(axis=1).astype(np.float64)
+            iou = tp / (tp + fp + fn + 1e-8)
+            for i, thr in enumerate(cfg.SHADOW_THRESHOLDS):
+                iou_by_thr[thr].append(float(iou[i]))
+
+        for thr, ious in iou_by_thr.items():
+            if not ious:
+                continue
+            med_iou = float(np.median(ious))
+            if best_shadow_iou is None or med_iou > best_shadow_iou:
+                best_shadow_iou = med_iou
+                best_shadow_cfg = {"weights": weights, "threshold": thr}
+
+    return {
+        "bst": best_bst,
+        "best_raw_config": best_raw_config,
+        "best_xgb_config": best_xgb_config,
+        "champion_source": champion_source,
+        "best_crf_config": {**best_crf_cfg, "k": best_raw_config["k"]},
+        "shadow_cfg": best_shadow_cfg,
+    }
+
+
+def infer_on_holdout(
+    holdout_path: str,
+    gt_vector_paths: list[str] | None,
+    model,
+    processor,
+    device,
+    pos_bank: np.ndarray,
+    neg_bank: np.ndarray | None,
+    tuned: dict,
+    ps: int,
+    tile_size: int,
+    stride: int,
+    feature_dir: str,
     shape_dir: str,
     context_radius: int,
 ):
-    """
-    Run the full pipeline on a single B tile and write per-tile outputs.
-    Returns the best (shadow-filtered) mask for optional union export.
-    """
-    t0_data = time_start()
-    img_b = load_dop20_image(img2_path)
-    labels_SH_B = reproject_labels_to_image(img2_path, cfg.SOURCE_LABEL_RASTER)
-    gt_mask_B = rasterize_vector_labels(gt_vector_paths, img2_path)
-    time_end("data_loading_and_reprojection", t0_data)
+    """Inference-only on holdout tile using fixed settings from validation."""
+    img_b, labels_sh, gt_mask_B, gt_mask_eval, sh_buffer_mask, buffer_m, pixel_size_m = load_b_tile_context(holdout_path, gt_vector_paths)
+    if gt_mask_eval is None:
+        logger.warning("Holdout has no GT; metrics will be reported as 0.0.")
+        gt_mask_eval = np.zeros(img_b.shape[:2], dtype=bool)
+        gt_mask_B = np.zeros(img_b.shape[:2], dtype=bool)
 
-    logger.debug("GT positives on B: %s", gt_mask_B.sum())
-    logger.debug("SH_2022 positives on B: %s", (labels_SH_B > 0).sum())
-
-    with __import__("rasterio").open(img2_path) as src:
-        pixel_size_m = abs(src.transform.a)
-    buffer_m = cfg.BUFFER_M
-    buffer_pixels = int(round(buffer_m / pixel_size_m))
-    logger.info("pixel_size=%.3f m, buffer_m=%s, buffer_pixels=%s", pixel_size_m, buffer_m, buffer_pixels)
-
-    sh_buffer_mask_B = build_sh_buffer_mask(labels_SH_B, buffer_pixels)
-    if getattr(cfg, "CLIP_GT_TO_BUFFER", False):
-        gt_mask_eval = np.logical_and(gt_mask_B, sh_buffer_mask_B)
-        logger.info("CLIP_GT_TO_BUFFER enabled: GT positives -> %s (was %s)", gt_mask_eval.sum(), gt_mask_B.sum())
-    else:
-        gt_mask_eval = gt_mask_B
-
-    _ = compute_oracle_upper_bound(gt_mask_eval, sh_buffer_mask_B)
-
-    image_id_b = os.path.splitext(os.path.basename(img2_path))[0]
-
+    image_id_b = os.path.splitext(os.path.basename(holdout_path))[0]
     prefetched_b = prefetch_features_single_scale_image(
-        img_b,
-        model,
-        processor,
-        device,
-        ps,
-        tile_size,
-        stride,
-        None,
-        feature_dir,
-        image_id_b,
+        img_b, model, processor, device, ps, tile_size, stride, None, feature_dir, image_id_b
     )
 
-    best_raw_config, best_raw_score_full, _ = grid_search_k_threshold(
+    k = tuned["best_raw_config"]["k"]
+    knn_thr = tuned["best_raw_config"]["threshold"]
+    score_knn, _ = zero_shot_knn_single_scale_B_with_saliency(
         img_b,
         pos_bank,
         neg_bank,
@@ -128,144 +456,62 @@ def process_b_tile(
         ps,
         tile_size,
         stride,
-        cfg.K_VALUES,
-        cfg.THRESHOLDS,
-        feature_dir,
-        image_id_b,
-        sh_buffer_mask_B,
-        gt_mask_eval,
-        prefetched_b,
-        USE_FP16_KNN,
+        k=k,
+        aggregate_layers=None,
+        feature_dir=feature_dir,
+        image_id=image_id_b,
+        neg_alpha=getattr(cfg, "NEG_ALPHA", 1.0),
+        prefetched_tiles=prefetched_b,
+        use_fp16_matmul=USE_FP16_KNN,
         context_radius=context_radius,
     )
+    mask_knn = (score_knn >= knn_thr) & sh_buffer_mask
+    mask_knn = median_filter(mask_knn.astype(np.uint8), size=3) > 0
+    metrics_knn = compute_metrics(mask_knn, gt_mask_eval)
 
-    thr_best_raw_refined, metrics_raw_refined, mask_raw_best = fine_tune_threshold(
-        best_raw_score_full,
-        best_raw_config["threshold"],
-        sh_buffer_mask_B,
-        gt_mask_eval,
+    bst = tuned["bst"]
+    xgb_thr = tuned["best_xgb_config"]["threshold"]
+    score_xgb = xgb_score_image_b(
+        img_b, bst, ps, tile_size, stride, feature_dir, image_id_b, prefetched_tiles=prefetched_b, context_radius=context_radius
     )
-    if metrics_raw_refined["iou"] >= best_raw_config["iou"]:
-        best_raw_config = {
-            **best_raw_config,
-            "threshold": thr_best_raw_refined,
-            **metrics_raw_refined,
-        }
+    mask_xgb = (score_xgb >= xgb_thr) & sh_buffer_mask
+    mask_xgb = median_filter(mask_xgb.astype(np.uint8), size=3) > 0
+    metrics_xgb = compute_metrics(mask_xgb, gt_mask_eval)
+
+    champion_source = tuned["champion_source"]
+    if champion_source == "raw":
+        champion_score = score_knn
+        thr_center_for_crf = knn_thr
+        best_raw_config = {**tuned["best_raw_config"], **metrics_knn}
     else:
-        mask_raw_best = best_raw_score_full >= best_raw_config["threshold"]
-        mask_raw_best = np.logical_and(mask_raw_best, sh_buffer_mask_B)
+        champion_score = score_xgb
+        thr_center_for_crf = xgb_thr
+        best_raw_config = {**tuned["best_xgb_config"], **metrics_xgb}
 
-    mask_raw_best = median_filter(mask_raw_best.astype(np.uint8), size=3) > 0
-    metrics_raw_filtered = compute_metrics(mask_raw_best, gt_mask_eval)
-    best_raw_config = {**best_raw_config, **metrics_raw_filtered}
+    crf_cfg = tuned["best_crf_config"]
+    best_crf_mask = refine_with_densecrf(
+        img_b,
+        champion_score,
+        thr_center_for_crf,
+        sh_buffer_mask,
+        prob_softness=crf_cfg["prob_softness"],
+        n_iters=5,
+        pos_w=crf_cfg["pos_w"],
+        pos_xy_std=crf_cfg["pos_xy_std"],
+        bilateral_w=crf_cfg["bilateral_w"],
+        bilateral_xy_std=crf_cfg["bilateral_xy_std"],
+        bilateral_rgb_std=crf_cfg["bilateral_rgb_std"],
+    )
+    best_crf_config = {**crf_cfg, **compute_metrics(best_crf_mask, gt_mask_eval)}
 
-    mask_knn = mask_raw_best.copy()
-    knn_config = best_raw_config.copy()
-
-    champion_config = best_raw_config
-    champion_score_full = best_raw_score_full
-    thr_center_for_crf = champion_config["threshold"]
-    k_center_for_crf = champion_config["k"]
-
-    use_gpu_xgb = getattr(cfg, "XGB_USE_GPU", True)
-    param_grid = getattr(cfg, "XGB_PARAM_GRID", None)
-    num_boost_round = getattr(cfg, "XGB_NUM_BOOST_ROUND", 300)
-    early_stop = getattr(cfg, "XGB_EARLY_STOP", 40)
-    verbose_eval = getattr(cfg, "XGB_VERBOSE_EVAL", 50)
-    val_fraction = getattr(cfg, "XGB_VAL_FRACTION", 0.2)
-
-    if param_grid:
-        bst, best_params_xgb, best_iou_xgb, best_thr_xgb, best_metrics_xgb = hyperparam_search_xgb_iou(
-            X,
-            y,
-            cfg.THRESHOLDS,
-            sh_buffer_mask_B,
-            gt_mask_eval,
-            img_b,
-            ps,
-            tile_size,
-            stride,
-            feature_dir,
-            image_id_b,
-            prefetched_tiles=prefetched_b,
-            device=device,
-            use_gpu=use_gpu_xgb,
-            param_grid=param_grid,
-            num_boost_round=num_boost_round,
-            val_fraction=val_fraction,
-            early_stopping_rounds=early_stop,
-            verbose_eval=verbose_eval,
-            seed=42,
-            context_radius=context_radius,
-        )
-        best_xgb = best_metrics_xgb
-        best_xgb_config = {
-            "k": -1,
-            "threshold": best_thr_xgb,
-            "source": "xgb",
-            **best_xgb,
-            "params": best_params_xgb,
-        }
-        score_full_xgb = xgb_score_image_b(
-            img_b,
-            bst,
-            ps,
-            tile_size,
-            stride,
-            feature_dir,
-            image_id_b,
-            prefetched_tiles=prefetched_b,
-            context_radius=context_radius,
-        )
-        mask_xgb = (score_full_xgb >= best_thr_xgb) & sh_buffer_mask_B
-        mask_xgb = median_filter(mask_xgb.astype(np.uint8), size=3) > 0
-        metrics_xgb_filtered = compute_metrics(mask_xgb, gt_mask_eval)
-        best_xgb_config = {**best_xgb_config, **metrics_xgb_filtered}
-        logger.info("xgb-best thr=%.3f, IoU=%.3f, F1=%.3f", best_thr_xgb, best_xgb_config["iou"], best_xgb_config["f1"])
-    else:
-        bst = train_xgb_classifier(
-            X,
-            y,
-            use_gpu=use_gpu_xgb,
-            num_boost_round=num_boost_round,
-            verbose_eval=verbose_eval,
-        )
-        best_params_xgb = None
-        score_full_xgb = xgb_score_image_b(
-            img_b,
-            bst,
-            ps,
-            tile_size,
-            stride,
-            feature_dir,
-            image_id_b,
-            prefetched_tiles=prefetched_b,
-            context_radius=context_radius,
-        )
-        try:
-            metrics_list = compute_metrics_batch_gpu(score_full_xgb, cfg.THRESHOLDS, sh_buffer_mask_B, gt_mask_eval, device=device)
-        except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
-            metrics_list = compute_metrics_batch_cpu(score_full_xgb, cfg.THRESHOLDS, sh_buffer_mask_B, gt_mask_eval)
-        best_xgb = max(metrics_list, key=lambda m: m["iou"])
-        mask_xgb = (score_full_xgb >= best_xgb["threshold"]) & sh_buffer_mask_B
-        mask_xgb = median_filter(mask_xgb.astype(np.uint8), size=3) > 0
-        metrics_xgb_filtered = compute_metrics(mask_xgb, gt_mask_eval)
-        best_xgb_config = {
-            "k": -1,
-            "threshold": best_xgb["threshold"],
-            "source": "xgb",
-            **metrics_xgb_filtered,
-            "params": best_params_xgb,
-        }
-        logger.info("xgb-best thr=%.3f, IoU=%.3f, F1=%.3f", best_xgb["threshold"], best_xgb_config["iou"], best_xgb_config["f1"])
-
-    if best_xgb_config["iou"] > champion_config["iou"]:
-        champion_config = best_xgb_config
-        champion_score_full = score_full_xgb
-        thr_center_for_crf = champion_config["threshold"]
-        k_center_for_crf = champion_config["k"]
-        mask_raw_best = mask_xgb
+    shadow_cfg = tuned["shadow_cfg"]
+    _, shadow_mask = shadow_filter_grid(
+        img_b,
+        best_crf_mask,
+        gt_mask_eval,
+        [shadow_cfg["weights"]],
+        [shadow_cfg["threshold"]],
+    )
 
     save_knn_xgb_gt_plot(
         img_b,
@@ -274,100 +520,47 @@ def process_b_tile(
         mask_xgb,
         cfg.PLOT_DIR,
         image_id_b,
-        title_knn=f"kNN IoU={knn_config['iou']:.3f}",
-        title_xgb=f"XGB IoU={best_xgb_config['iou']:.3f}",
+        title_knn=f"kNN IoU={metrics_knn['iou']:.3f}",
+        title_xgb=f"XGB IoU={metrics_xgb['iou']:.3f}",
         filename_suffix="knn_vs_xgb.png",
     )
-
     save_best_model_plot(
         img_b,
         gt_mask_eval,
-        mask_raw_best,
-        title=f"Champion ({champion_config['source']}) IoU={champion_config['iou']:.3f}",
+        mask_knn if champion_source == "raw" else mask_xgb,
+        title=f"Champion ({champion_source}) IoU={best_raw_config['iou']:.3f}",
         plot_dir=cfg.PLOT_DIR,
         image_id_b=image_id_b,
         filename_suffix="champion_pre_crf.png",
     )
-
-    for _obj in ["prefetched_b", "best_raw_score_full", "score_full_xgb"]:
-        if _obj in locals():
-            del locals()[_obj]
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
-    best_crf_cfg_inner, best_crf_mask = crf_grid_search(
-        img_b,
-        champion_score_full,
-        thr_center_for_crf,
-        sh_buffer_mask_B,
-        gt_mask_eval,
-        cfg.PROB_SOFTNESS_VALUES,
-        cfg.POS_W_VALUES,
-        cfg.POS_XY_STD_VALUES,
-        cfg.BILATERAL_W_VALUES,
-        cfg.BILATERAL_XY_STD_VALUES,
-        cfg.BILATERAL_RGB_STD_VALUES,
-        5,
-        CRF_MAX_CONFIGS,
-        2,
-        cfg.CRF_NUM_WORKERS,
-        "process",
-    )
-
-    best_crf_config = {"k": k_center_for_crf, **best_crf_cfg_inner}
-    if best_crf_mask.shape != img_b.shape[:2]:
-        best_crf_mask_full = resize(
-            best_crf_mask.astype(np.float32),
-            (img_b.shape[0], img_b.shape[1]),
-            order=0, preserve_range=True, anti_aliasing=False
-        ) > 0.5
-        best_crf_mask = best_crf_mask_full
-        metrics_crf_full = compute_metrics(best_crf_mask, gt_mask_eval)
-        logger.info(
-            "crf-upsampled IoU=%.3f, F1=%.3f, P=%.3f, R=%.3f",
-            metrics_crf_full["iou"],
-            metrics_crf_full["f1"],
-            metrics_crf_full["precision"],
-            metrics_crf_full["recall"],
-        )
-
-    shadow_cfg, shadow_mask = shadow_filter_grid(
-        img_b,
-        best_crf_mask,
-        gt_mask_eval,
-        cfg.SHADOW_WEIGHT_SETS,
-        cfg.SHADOW_THRESHOLDS
-    )
-    shadow_best = {"cfg": shadow_cfg, "mask": shadow_mask}
-
     save_plot(
         img_b,
-        gt_mask_B,
-        mask_raw_best,
+        gt_mask_eval,
+        mask_knn if champion_source == "raw" else mask_xgb,
         best_raw_config,
         best_crf_mask,
         best_crf_config,
         thr_center_for_crf,
         cfg.PLOT_DIR,
         image_id_b,
-        best_shadow=shadow_best
+        best_shadow={"cfg": shadow_cfg, "mask": shadow_mask},
+        labels_sh=labels_sh,
     )
 
-    base_name_b = os.path.splitext(os.path.basename(img2_path))[0]
     export_mask_to_shapefile(
-        mask_raw_best,
-        img2_path,
-        os.path.join(shape_dir, f"{base_name_b}_pred_mask_best_raw.shp")
+        mask_knn if champion_source == "raw" else mask_xgb,
+        holdout_path,
+        os.path.join(shape_dir, f"{image_id_b}_pred_mask_best_raw.shp")
     )
     export_mask_to_shapefile(
         best_crf_mask,
-        img2_path,
-        os.path.join(shape_dir, f"{base_name_b}_pred_mask_best_crf.shp")
+        holdout_path,
+        os.path.join(shape_dir, f"{image_id_b}_pred_mask_best_crf.shp")
     )
     export_mask_to_shapefile(
         shadow_mask,
-        img2_path,
-        os.path.join(shape_dir, f"{base_name_b}_pred_mask_best_shadow.shp")
+        holdout_path,
+        os.path.join(shape_dir, f"{image_id_b}_pred_mask_best_shadow.shp")
     )
 
     export_best_settings(
@@ -375,7 +568,7 @@ def process_b_tile(
         best_crf_config,
         cfg.MODEL_NAME,
         getattr(cfg, "SOURCE_TILES", None) or cfg.SOURCE_TILE,
-        img2_path,
+        holdout_path,
         buffer_m,
         pixel_size_m,
         shadow_cfg=shadow_cfg,
@@ -387,10 +580,10 @@ def process_b_tile(
             "neg_alpha": getattr(cfg, "NEG_ALPHA", 1.0),
             "pos_frac_thresh": getattr(cfg, "POS_FRAC_THRESH", 0.1),
         },
-        best_settings_path=os.path.join(os.path.dirname(cfg.BEST_SETTINGS_PATH), f"best_settings_{base_name_b}.yml"),
+        best_settings_path=os.path.join(os.path.dirname(cfg.BEST_SETTINGS_PATH), f"best_settings_{image_id_b}.yml"),
     )
 
-    return shadow_mask, img2_path
+    return shadow_mask, holdout_path
 
 
 def main():
@@ -422,7 +615,7 @@ def main():
     source_tile_default = cfg.SOURCE_TILE
     target_tile = cfg.TARGET_TILE
     source_label_raster = cfg.SOURCE_LABEL_RASTER
-    gt_vector_paths = getattr(cfg, "EVAL_GT_VECTORS", None) or cfg.EVAL_GT_VECTOR
+    gt_vector_paths = cfg.EVAL_GT_VECTORS
 
     # ------------------------------------------------------------
     # Resolve one or more labeled source images (Image A list)
@@ -433,10 +626,13 @@ def main():
     context_radius = int(getattr(cfg, "FEAT_CONTEXT_RADIUS", 0) or 0)
 
     # ------------------------------------------------------------
-    # Resolve B tile paths and GT labels (union of GT vectors)
+    # Resolve validation + holdout tiles (required)
     # ------------------------------------------------------------
-    img_b_paths = getattr(cfg, "TARGET_TILES", None) or [target_tile]
-    gt_vector_paths = getattr(cfg, "EVAL_GT_VECTORS", None) or cfg.EVAL_GT_VECTOR
+    val_tiles = cfg.VAL_TILES
+    holdout_tiles = cfg.HOLDOUT_TILES
+    if not val_tiles or not holdout_tiles:
+        raise ValueError("VAL_TILES and HOLDOUT_TILES must be set for main.py.")
+    gt_vector_paths = cfg.EVAL_GT_VECTORS
 
     # ------------------------------------------------------------
     # Output organization + feature caching
@@ -510,11 +706,47 @@ def main():
     y = np.concatenate(y_list) if y_list else np.empty((0,), dtype=np.float32)
 
     # ------------------------------------------------------------
-    # Run per-B tile processing + unified shapefile
+    # Tune on validation tile, then infer on holdout tiles
     # ------------------------------------------------------------
+    tuned = tune_on_validation_multi(
+        val_tiles,
+        gt_vector_paths,
+        model,
+        processor,
+        device,
+        pos_bank,
+        neg_bank,
+        X,
+        y,
+        ps,
+        tile_size,
+        stride,
+        feature_dir,
+        context_radius,
+    )
+
     masks_for_union = []
-    for b_path in img_b_paths:
-        shadow_mask, ref_path = process_b_tile(
+    # Run inference on validation tiles with fixed settings (for plots/metrics)
+    for val_path in val_tiles:
+        infer_on_holdout(
+            val_path,
+            gt_vector_paths,
+            model,
+            processor,
+            device,
+            pos_bank,
+            neg_bank,
+            tuned,
+            ps,
+            tile_size,
+            stride,
+            feature_dir,
+            shape_dir,
+            context_radius,
+        )
+
+    for b_path in holdout_tiles:
+        shadow_mask, ref_path = infer_on_holdout(
             b_path,
             gt_vector_paths,
             model,
@@ -522,8 +754,7 @@ def main():
             device,
             pos_bank,
             neg_bank,
-            X,
-            y,
+            tuned,
             ps,
             tile_size,
             stride,
@@ -544,7 +775,7 @@ def main():
     # ------------------------------------------------------------
     for image_id_a in image_id_a_list:
         consolidate_features_for_image(feature_dir, image_id_a)
-    for b_path in img_b_paths:
+    for b_path in val_tiles + holdout_tiles:
         image_id_b = os.path.splitext(os.path.basename(b_path))[0]
         consolidate_features_for_image(feature_dir, image_id_b)
 

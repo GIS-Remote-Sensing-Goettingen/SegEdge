@@ -12,15 +12,15 @@ TARGET_TILE = "data/dop20_592000_5982000_1km_20cm.tif"
 # Label raster used to build banks on SOURCE_* tiles.
 SOURCE_LABEL_RASTER = "data/lables/planet_labels_2022.tif"
 
-# Evaluation GT vectors (union-merged).
-EVAL_GT_VECTOR = "data/lables/labels_final.shp"
+# Evaluation GT vectors (union-merged). Use EVAL_GT_VECTORS when available,
 EVAL_GT_VECTORS = [
     "data/lables/lables_1.shp",
     "data/lables/lables_2.shp",
     "data/lables/lables_3.shp",
+    "data/lables/labels_final.shp",
 ]
 
-# Multi-tile inputs (set to None to use SOURCE_TILE / TARGET_TILE).
+# Multi-tile inputs (set to None to use SOURCE_TILE).
 SOURCE_TILES = [
     "data/tiles/dop20_596000_5974000_1km_20cm.tif",
     "data/tiles/dop20_596000_5975000_1km_20cm.tif",
@@ -28,13 +28,18 @@ SOURCE_TILES = [
     "data/tiles/dop20_596000_5977000_1km_20cm.tif",
     "data/tiles/dop20_596000_5983000_1km_20cm.tif",
 ]
-TARGET_TILES = [
+
+# Validation tiles (first is used for tuning; the rest are evaluated with fixed settings).
+VAL_TILES = [
     "data/tiles/dop20_596000_5974000_1km_20cm.tif",
+]
+HOLDOUT_TILES = [
     "data/tiles/dop20_596000_5975000_1km_20cm.tif",
     "data/tiles/dop20_596000_5976000_1km_20cm.tif",
     "data/tiles/dop20_596000_5977000_1km_20cm.tif",
     "data/tiles/dop20_596000_5983000_1km_20cm.tif",
 ]
+
 
 # Output locations (everything except DINO features).
 FEATURE_DIR = "data/dino_features"
@@ -112,5 +117,3 @@ XGB_PARAM_GRID = [
 CLIP_GT_TO_BUFFER = True
 
 # Split evaluation (used by split_eval.py).
-VAL_TILE = None  # defaults to TARGET_TILE
-HOLDOUT_TILES = None  # e.g. ["data/tiles/holdout_1.tif", "data/tiles/holdout_2.tif"]
