@@ -32,12 +32,12 @@ SOURCE_TILES = [
 # Validation tiles (first is used for tuning; the rest are evaluated with fixed settings).
 VAL_TILES = [
     "data/tiles/dop20_596000_5974000_1km_20cm.tif",
+    "data/tiles/dop20_596000_5977000_1km_20cm.tif",
+    "data/tiles/dop20_596000_5983000_1km_20cm.tif",
 ]
 HOLDOUT_TILES = [
     "data/tiles/dop20_596000_5975000_1km_20cm.tif",
     "data/tiles/dop20_596000_5976000_1km_20cm.tif",
-    "data/tiles/dop20_596000_5977000_1km_20cm.tif",
-    "data/tiles/dop20_596000_5983000_1km_20cm.tif",
 ]
 
 
