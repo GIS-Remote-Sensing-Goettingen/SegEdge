@@ -80,7 +80,7 @@ This document gives a complete, self-contained description of the SegEdge zero-s
 ---
 
 ## 6) Configuration & Runtime Controls (config.py)
-- Paths: `IMG_PATH`, `IMG2_PATH`, `LAB_PATH`, `GT_VECTOR_PATH`, `FEATURE_DIR`, `BANK_CACHE_DIR`, `PLOT_DIR`, `BEST_SETTINGS_PATH`.
+- Paths: `SOURCE_TILE`, `TARGET_TILE`, `SOURCE_LABEL_RASTER`, `EVAL_GT_VECTOR`/`EVAL_GT_VECTORS`, `FEATURE_DIR`, `BANK_CACHE_DIR`, `PLOT_DIR`, `BEST_SETTINGS_PATH`.
 - Geometry: `BUFFER_M`, `TILE_SIZE`, `STRIDE`, `PATCH_SIZE`.
 - Banks/Scoring: `NEG_ALPHA`, `POS_FRAC_THRESH`, `MAX_NEG_BANK`.
 - kNN grid: `K_VALUES`, `THRESHOLDS`, `USE_FP16_KNN`, `USE_GPU_THRESHOLD_METRICS`, batch sizes.

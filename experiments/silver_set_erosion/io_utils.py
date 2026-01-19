@@ -152,6 +152,37 @@ def export_mask_to_shapefile(mask: np.ndarray, ref_raster_path: str, out_path: s
     logger.info("shapefile written to: %s", out_path)
 
 
+def export_masks_to_shapefile_union(masks_with_refs: list[tuple[np.ndarray, str]], out_path: str):
+    """
+    Write multiple masks (each tied to its own reference raster) into a single shapefile.
+
+    This does not dissolve overlaps; it simply appends all polygons into one layer.
+    """
+    t0 = time_start()
+    if not masks_with_refs:
+        logger.warning("export_masks_to_shapefile_union: no masks provided")
+        return
+    _, first_ref = masks_with_refs[0]
+    with rasterio.open(first_ref) as src:
+        crs = src.crs
+    schema = {"geometry": "Polygon", "properties": {"id": "int"}}
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    idx = 0
+    with fiona.open(out_path, mode="w", driver="ESRI Shapefile", crs=crs.to_dict() if crs is not None else None, schema=schema) as shp:
+        for mask, ref_raster_path in masks_with_refs:
+            mask_uint8 = mask.astype("uint8")
+            with rasterio.open(ref_raster_path) as src:
+                transform = src.transform
+            shape_generator = rfeatures.shapes(mask_uint8, mask=mask_uint8 == 1, transform=transform)
+            for geom, value in shape_generator:
+                if value != 1:
+                    continue
+                shp.write({"geometry": geom, "properties": {"id": int(idx)}})
+                idx += 1
+    time_end("export_masks_to_shapefile_union", t0)
+    logger.info("union shapefile written to: %s (features=%s)", out_path, idx)
+
+
 def consolidate_features_for_image(feature_dir: str, image_id: str, output_suffix: str = "_features_full.npy"):
     """Concatenate all tile feature .npy files for an image into a single array; return path."""
     t0 = time_start()
@@ -186,7 +217,8 @@ def export_best_settings(best_raw_config,
                          buffer_m,
                          pixel_size_m,
                          shadow_cfg=None,
-                         extra_settings: dict | None = None):
+                         extra_settings: dict | None = None,
+                         best_settings_path: str | None = None):
     """
     Write a minimal YAML with the champion configurations and context (paths, buffer, pixel size).
     """
@@ -202,8 +234,9 @@ def export_best_settings(best_raw_config,
     }
     if extra_settings:
         best_settings["extra"] = extra_settings
-    os.makedirs(os.path.dirname(cfg.BEST_SETTINGS_PATH), exist_ok=True)
-    with open(cfg.BEST_SETTINGS_PATH, "w", encoding="utf-8") as f:
+    out_path = best_settings_path or cfg.BEST_SETTINGS_PATH
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
         def _write_yaml(d, indent=0):
             for k, v in d.items():
                 if isinstance(v, dict):
@@ -212,4 +245,4 @@ def export_best_settings(best_raw_config,
                 else:
                     f.write("  " * indent + f"{k}: {v}\n")
         _write_yaml(best_settings)
-    logger.info("best settings written to %s", cfg.BEST_SETTINGS_PATH)
+    logger.info("best settings written to %s", out_path)

@@ -23,6 +23,7 @@ from io_utils import (
     rasterize_vector_labels,
     build_sh_buffer_mask,
     export_mask_to_shapefile,
+    export_masks_to_shapefile_union,
     consolidate_features_for_image,
     export_best_settings,
 )
@@ -57,190 +58,93 @@ def init_model(model_name: str):
     return model, processor, device
 
 
-def main():
+def process_b_tile(
+    img2_path: str,
+    gt_vector_paths,
+    model,
+    processor,
+    device,
+    pos_bank: np.ndarray,
+    neg_bank: np.ndarray | None,
+    X: np.ndarray,
+    y: np.ndarray,
+    ps: int,
+    tile_size: int,
+    stride: int,
+    feature_dir: str,
+    shape_dir: str,
+    context_radius: int,
+):
     """
-    Full segmentation pipeline:
-         • Build banks from Image A
-         • kNN transfer to Image B
-         • Threshold selection
-         • CRF refinement
-         • Shadow filtering
-         • Export diagnostics + shapefiles
+    Run the full pipeline on a single B tile and write per-tile outputs.
+    Returns the best (shadow-filtered) mask for optional union export.
     """
-
-    setup_logging(getattr(cfg, "LOG_PATH", None))
-    t0_main = time_start()
-    model_name = cfg.MODEL_NAME
-
-    # ------------------------------------------------------------
-    # Init DINOv3 model & processor
-    # ------------------------------------------------------------
-    model, processor, device = init_model(model_name)
-    ps = getattr(cfg, "PATCH_SIZE", model.config.patch_size)
-    tile_size = getattr(cfg, "TILE_SIZE", 1024)
-    stride = getattr(cfg, "STRIDE", tile_size)
-
-    # ------------------------------------------------------------
-    # Resolve paths to imagery + SH_2022 + GT vector labels
-    # ------------------------------------------------------------
-    img_path_default = cfg.IMG_PATH
-    img2_path = cfg.IMG2_PATH
-    lab_path = cfg.LAB_PATH
-    gt_vector_paths = getattr(cfg, "GT_VECTOR_PATHS", None) or cfg.GT_VECTOR_PATH
-
-    # ------------------------------------------------------------
-    # Resolve one or more labeled source images (Image A list)
-    # ------------------------------------------------------------
-    img_a_paths = getattr(cfg, "IMG_A_PATHS", None) or [img_path_default]
-    lab_a_paths = getattr(cfg, "LAB_A_PATHS", None)
-    if lab_a_paths is None:
-        lab_a_paths = [lab_path] * len(img_a_paths)
-    if len(lab_a_paths) != len(img_a_paths):
-        raise ValueError("LAB_A_PATHS must be None or have the same length as IMG_A_PATHS")
-
-    context_radius = int(getattr(cfg, "FEAT_CONTEXT_RADIUS", 0) or 0)
-
-    # ------------------------------------------------------------
-    # Load imagery and reproject labels (Image B + SH + GT)
-    # ------------------------------------------------------------
     t0_data = time_start()
-    img_b = load_dop20_image(
-        img2_path       # target image B for inference
-    )
-    labels_SH_B = reproject_labels_to_image(
-        img2_path,      # image B path
-        lab_path        # SH_2022 raster
-    )
-
-    gt_mask_B = rasterize_vector_labels(
-        gt_vector_paths, # vector ground truth polygon(s) for B (union-merged if list)
-        img2_path        # raster reference to match CRS/resolution
-    )
+    img_b = load_dop20_image(img2_path)
+    labels_SH_B = reproject_labels_to_image(img2_path, cfg.SOURCE_LABEL_RASTER)
+    gt_mask_B = rasterize_vector_labels(gt_vector_paths, img2_path)
     time_end("data_loading_and_reprojection", t0_data)
 
     logger.debug("GT positives on B: %s", gt_mask_B.sum())
     logger.debug("SH_2022 positives on B: %s", (labels_SH_B > 0).sum())
 
-    # ------------------------------------------------------------
-    # Build SH_2022 buffer (spatial prior)
-    # ------------------------------------------------------------
-    with __import__('rasterio').open(img2_path) as src:
+    with __import__("rasterio").open(img2_path) as src:
         pixel_size_m = abs(src.transform.a)
-
     buffer_m = cfg.BUFFER_M
     buffer_pixels = int(round(buffer_m / pixel_size_m))
     logger.info("pixel_size=%.3f m, buffer_m=%s, buffer_pixels=%s", pixel_size_m, buffer_m, buffer_pixels)
 
-    sh_buffer_mask_B = build_sh_buffer_mask(
-        labels_SH_B,    # SH_2022 label raster on B
-        buffer_pixels   # radius in pixel units for dilation
-    )
-
+    sh_buffer_mask_B = build_sh_buffer_mask(labels_SH_B, buffer_pixels)
     if getattr(cfg, "CLIP_GT_TO_BUFFER", False):
         gt_mask_eval = np.logical_and(gt_mask_B, sh_buffer_mask_B)
         logger.info("CLIP_GT_TO_BUFFER enabled: GT positives -> %s (was %s)", gt_mask_eval.sum(), gt_mask_B.sum())
     else:
         gt_mask_eval = gt_mask_B
 
-    _ = compute_oracle_upper_bound(
-        gt_mask_eval,      # GT mask on B (possibly clipped)
-        sh_buffer_mask_B  # SH buffer region (max allowed FG region)
-    )
+    _ = compute_oracle_upper_bound(gt_mask_eval, sh_buffer_mask_B)
 
-    # ------------------------------------------------------------
-    # Feature caching
-    # ------------------------------------------------------------
-    feature_dir = cfg.FEATURE_DIR
-    os.makedirs(feature_dir, exist_ok=True)
-
-    image_id_a_list = [os.path.splitext(os.path.basename(p))[0] for p in img_a_paths]
     image_id_b = os.path.splitext(os.path.basename(img2_path))[0]
 
-    # ------------------------------------------------------------
-    # Build DINOv3 positive/negative banks from one or more Image A sources
-    # ------------------------------------------------------------
-    pos_banks = []
-    neg_banks = []
-    for img_a_path, lab_a_path, image_id_a in zip(img_a_paths, lab_a_paths, image_id_a_list, strict=True):
-        logger.info("source A: %s (labels: %s)", img_a_path, lab_a_path)
-        img_a = load_dop20_image(img_a_path)
-        labels_A = reproject_labels_to_image(img_a_path, lab_a_path)
-
-        pos_bank_i, neg_bank_i = build_banks_single_scale(
-            img_a,                    # img_a: RGB array
-            labels_A,                 # SH labels on A (reprojected)
-            model,                    # DINO model
-            processor,                # processor
-            device,                   # GPU/CPU device
-            ps,                       # patch size
-            tile_size,                # tiling
-            stride,                   # overlap
-            getattr(cfg, "POS_FRAC_THRESH", 0.1),
-            None,
-            feature_dir,
-            image_id_a,
-            cfg.BANK_CACHE_DIR,
-            context_radius=context_radius,
-        )
-        pos_banks.append(pos_bank_i)
-        if neg_bank_i is not None and len(neg_bank_i) > 0:
-            neg_banks.append(neg_bank_i)
-
-    pos_bank = np.concatenate(pos_banks, axis=0)
-    neg_bank = np.concatenate(neg_banks, axis=0) if neg_banks else None
-    logger.info("combined banks: pos=%s, neg=%s", len(pos_bank), 0 if neg_bank is None else len(neg_bank))
-
-    # ------------------------------------------------------------
-    # Prefetch DINO features for Image B (so kNN grid search is fast)
-    # ------------------------------------------------------------
     prefetched_b = prefetch_features_single_scale_image(
-        img_b,                  # img_hw3: RGB array of image B
-        model,                  # DINO model
-        processor,              # processor
-        device,                 # GPU/CPU
-        ps,                     # ps: ViT patch size
-        tile_size,              # tile_size
-        stride,                 # stride
-        None,                   # aggregate_layers
-        feature_dir,            # location to load/store B’s features
-        image_id_b              # ID for B tiles
+        img_b,
+        model,
+        processor,
+        device,
+        ps,
+        tile_size,
+        stride,
+        None,
+        feature_dir,
+        image_id_b,
     )
 
-    # ------------------------------------------------------------
-    # kNN grid search (k-values × thresholds)
-    # ------------------------------------------------------------
-    best_raw_config, best_raw_score_full, best_raw_saliency_full = grid_search_k_threshold(
-        img_b,                 # full RGB image B
-        pos_bank,              # positive bank (N_pos × C)
-        neg_bank,              # negative bank (N_neg × C)
-        model,                 # DINO model
-        processor,             # image processor
-        device,                # GPU device
-        ps,                    # ps
-        tile_size,             # tile_size
-        stride,                # stride
-        cfg.K_VALUES,          # list of k-values to try (e.g. [1,3,5,7])
-        cfg.THRESHOLDS,        # global thresholds for FG mask
-        feature_dir,           # directory for B/features
-        image_id_b,            # B tile cache ID
-        sh_buffer_mask_B,      # spatial prior mask
-        gt_mask_eval,          # ground-truth for scoring
-        prefetched_b,          # cached DINO features for B
-        USE_FP16_KNN,          # use half precision matmul for speed
+    best_raw_config, best_raw_score_full, _ = grid_search_k_threshold(
+        img_b,
+        pos_bank,
+        neg_bank,
+        model,
+        processor,
+        device,
+        ps,
+        tile_size,
+        stride,
+        cfg.K_VALUES,
+        cfg.THRESHOLDS,
+        feature_dir,
+        image_id_b,
+        sh_buffer_mask_B,
+        gt_mask_eval,
+        prefetched_b,
+        USE_FP16_KNN,
         context_radius=context_radius,
     )
 
-    # ------------------------------------------------------------
-    # Local threshold refinement around the best raw solution
-    # ------------------------------------------------------------
     thr_best_raw_refined, metrics_raw_refined, mask_raw_best = fine_tune_threshold(
-        best_raw_score_full,   # score_map from best k
-        best_raw_config["threshold"],  # base threshold to refine
-        sh_buffer_mask_B,      # prior mask
-        gt_mask_eval           # GT for evaluation
+        best_raw_score_full,
+        best_raw_config["threshold"],
+        sh_buffer_mask_B,
+        gt_mask_eval,
     )
-
-    # Update configuration if refined solution is better
     if metrics_raw_refined["iou"] >= best_raw_config["iou"]:
         best_raw_config = {
             **best_raw_config,
@@ -251,12 +155,10 @@ def main():
         mask_raw_best = best_raw_score_full >= best_raw_config["threshold"]
         mask_raw_best = np.logical_and(mask_raw_best, sh_buffer_mask_B)
 
-    # Median filter to clean speckle after thresholding
     mask_raw_best = median_filter(mask_raw_best.astype(np.uint8), size=3) > 0
     metrics_raw_filtered = compute_metrics(mask_raw_best, gt_mask_eval)
     best_raw_config = {**best_raw_config, **metrics_raw_filtered}
 
-    # Preserve kNN mask/config before potential champion swap
     mask_knn = mask_raw_best.copy()
     knn_config = best_raw_config.copy()
 
@@ -264,31 +166,6 @@ def main():
     champion_score_full = best_raw_score_full
     thr_center_for_crf = champion_config["threshold"]
     k_center_for_crf = champion_config["k"]
-
-    # ------------------------------------------------------------
-    # XGBoost branch (patch-level classifier)
-    # ------------------------------------------------------------
-    X_list = []
-    y_list = []
-    for img_a_path, lab_a_path, image_id_a in zip(img_a_paths, lab_a_paths, image_id_a_list, strict=True):
-        img_a = load_dop20_image(img_a_path)
-        labels_A = reproject_labels_to_image(img_a_path, lab_a_path)
-        X_i, y_i = build_xgb_dataset(
-            img_a,
-            labels_A,
-            ps,
-            tile_size,
-            stride,
-            feature_dir,
-            image_id_a,
-            pos_frac=cfg.POS_FRAC_THRESH,
-            max_neg=getattr(cfg, "MAX_NEG_BANK", 8000),
-            context_radius=context_radius,
-        )
-        X_list.append(X_i)
-        y_list.append(y_i)
-    X = np.vstack(X_list) if X_list else np.empty((0, 0), dtype=np.float32)
-    y = np.concatenate(y_list) if y_list else np.empty((0,), dtype=np.float32)
 
     use_gpu_xgb = getattr(cfg, "XGB_USE_GPU", True)
     param_grid = getattr(cfg, "XGB_PARAM_GRID", None)
@@ -383,7 +260,6 @@ def main():
         }
         logger.info("xgb-best thr=%.3f, IoU=%.3f, F1=%.3f", best_xgb["threshold"], best_xgb_config["iou"], best_xgb_config["f1"])
 
-    # Champion selection: choose better of kNN or XGB for CRF
     if best_xgb_config["iou"] > champion_config["iou"]:
         champion_config = best_xgb_config
         champion_score_full = score_full_xgb
@@ -391,7 +267,6 @@ def main():
         k_center_for_crf = champion_config["k"]
         mask_raw_best = mask_xgb
 
-    # Save GT vs kNN vs XGB overlays
     save_knn_xgb_gt_plot(
         img_b,
         gt_mask_eval,
@@ -404,7 +279,6 @@ def main():
         filename_suffix="knn_vs_xgb.png",
     )
 
-    # Quick visualization of champion vs GT before CRF
     save_best_model_plot(
         img_b,
         gt_mask_eval,
@@ -415,53 +289,40 @@ def main():
         filename_suffix="champion_pre_crf.png",
     )
 
-    # Free large intermediates before CRF
-    for _obj in ["pos_bank", "neg_bank", "prefetched_b", "best_raw_score_full", "best_raw_saliency_full", "score_full_xgb"]:
+    for _obj in ["prefetched_b", "best_raw_score_full", "score_full_xgb"]:
         if _obj in locals():
             del locals()[_obj]
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    # ------------------------------------------------------------
-    # CRF grid search (spatial regularization)
-    # ------------------------------------------------------------
     best_crf_cfg_inner, best_crf_mask = crf_grid_search(
-        img_b,                       # RGB on B
-        champion_score_full,         # score map from best raw stage
-        thr_center_for_crf,          # CRF unary logistic center
-        sh_buffer_mask_B,            # prior mask
-        gt_mask_eval,                # GT mask
-        cfg.PROB_SOFTNESS_VALUES,    # CRF unary softness candidates
-        cfg.POS_W_VALUES,            # Gaussian pairwise compat weights
-        cfg.POS_XY_STD_VALUES,       # Gaussian XY sigma
-        cfg.BILATERAL_W_VALUES,      # bilateral compat weights
-        cfg.BILATERAL_XY_STD_VALUES, # bilateral XY sigma
-        cfg.BILATERAL_RGB_STD_VALUES,# bilateral RGB sigma
-        5,                           # n_iters: mean-field iterations
-        CRF_MAX_CONFIGS,             # max configs to search
-        2,                           # downsample_factor: speed boost
-        cfg.CRF_NUM_WORKERS,         # multiprocessing workers
-        "process"                    # backend: process-based parallelism
+        img_b,
+        champion_score_full,
+        thr_center_for_crf,
+        sh_buffer_mask_B,
+        gt_mask_eval,
+        cfg.PROB_SOFTNESS_VALUES,
+        cfg.POS_W_VALUES,
+        cfg.POS_XY_STD_VALUES,
+        cfg.BILATERAL_W_VALUES,
+        cfg.BILATERAL_XY_STD_VALUES,
+        cfg.BILATERAL_RGB_STD_VALUES,
+        5,
+        CRF_MAX_CONFIGS,
+        2,
+        cfg.CRF_NUM_WORKERS,
+        "process",
     )
 
-    best_crf_config = {
-        "k": k_center_for_crf,       # inherited from raw best
-        **best_crf_cfg_inner         # CRF hyperparams
-    }
-
-    # If CRF was computed at lower resolution → upsample to original grid
+    best_crf_config = {"k": k_center_for_crf, **best_crf_cfg_inner}
     if best_crf_mask.shape != img_b.shape[:2]:
         best_crf_mask_full = resize(
-            best_crf_mask.astype(np.float32),   # low-res CRF output
-            (img_b.shape[0], img_b.shape[1]),   # original size
+            best_crf_mask.astype(np.float32),
+            (img_b.shape[0], img_b.shape[1]),
             order=0, preserve_range=True, anti_aliasing=False
         ) > 0.5
         best_crf_mask = best_crf_mask_full
-
-        metrics_crf_full = compute_metrics(
-            best_crf_mask,      # upsampled CRF mask
-            gt_mask_eval        # GT
-        )
+        metrics_crf_full = compute_metrics(best_crf_mask, gt_mask_eval)
         logger.info(
             "crf-upsampled IoU=%.3f, F1=%.3f, P=%.3f, R=%.3f",
             metrics_crf_full["iou"],
@@ -470,77 +331,53 @@ def main():
             metrics_crf_full["recall"],
         )
 
-    # ------------------------------------------------------------
-    # Shadow filtering stage
-    # ------------------------------------------------------------
     shadow_cfg, shadow_mask = shadow_filter_grid(
-        img_b,                                 # RGB B
-        best_crf_mask,                         # mask after CRF
-        gt_mask_eval,                          # GT for scoring
-        cfg.SHADOW_WEIGHT_SETS,                # e.g. [(1,1,1), (0.7,1,1)]
-        cfg.SHADOW_THRESHOLDS                  # thresholds in weighted-sum space
+        img_b,
+        best_crf_mask,
+        gt_mask_eval,
+        cfg.SHADOW_WEIGHT_SETS,
+        cfg.SHADOW_THRESHOLDS
     )
     shadow_best = {"cfg": shadow_cfg, "mask": shadow_mask}
 
-    # ------------------------------------------------------------
-    # Diagnostics + visualization
-    # ------------------------------------------------------------
     save_plot(
-        img_b,                 # RGB B
-        gt_mask_B,             # GT mask
-        mask_raw_best,         # raw (after refined threshold)
-        best_raw_config,       # raw pipeline config
-        best_crf_mask,         # CRF output
-        best_crf_config,       # CRF config
-        thr_center_for_crf,    # raw threshold used for CRF unary center
-        cfg.PLOT_DIR,          # where to save plots
-        image_id_b,            # identifier for outputs
-        best_shadow=shadow_best  # shadow filtering results
+        img_b,
+        gt_mask_B,
+        mask_raw_best,
+        best_raw_config,
+        best_crf_mask,
+        best_crf_config,
+        thr_center_for_crf,
+        cfg.PLOT_DIR,
+        image_id_b,
+        best_shadow=shadow_best
     )
 
-    # ------------------------------------------------------------
-    # Export shapefiles (raw, CRF, shadow)
-    # ------------------------------------------------------------
     base_name_b = os.path.splitext(os.path.basename(img2_path))[0]
-    out_dir_b = os.path.dirname(img2_path)
-
     export_mask_to_shapefile(
-        mask_raw_best,                         # raw prediction mask
-        img2_path,                             # reference image
-        os.path.join(out_dir_b, f"{base_name_b}_pred_mask_best_raw.shp")
-    )
-    export_mask_to_shapefile(
-        best_crf_mask,                         # CRF-refined mask
+        mask_raw_best,
         img2_path,
-        os.path.join(out_dir_b, f"{base_name_b}_pred_mask_best_crf.shp")
+        os.path.join(shape_dir, f"{base_name_b}_pred_mask_best_raw.shp")
     )
     export_mask_to_shapefile(
-        shadow_mask,                           # shadow-filtered final mask
+        best_crf_mask,
         img2_path,
-        os.path.join(out_dir_b, f"{base_name_b}_pred_mask_best_shadow.shp")
+        os.path.join(shape_dir, f"{base_name_b}_pred_mask_best_crf.shp")
+    )
+    export_mask_to_shapefile(
+        shadow_mask,
+        img2_path,
+        os.path.join(shape_dir, f"{base_name_b}_pred_mask_best_shadow.shp")
     )
 
-    # ------------------------------------------------------------
-    # Consolidate tile-level feature files (.npy) → one per image
-    # ------------------------------------------------------------
-    for image_id_a in image_id_a_list:
-        consolidate_features_for_image(feature_dir, image_id_a)
-    consolidate_features_for_image(
-        feature_dir,
-        image_id_b          # ID for image B
-    )
-
-    # ------------------------------------------------------------
-    # Export best settings for reproducibility
-    # ------------------------------------------------------------
     export_best_settings(
-        best_raw_config,    # raw pipeline config
-        best_crf_config,    # CRF config
-        model_name,         # DINO model name
-        img_a_paths,        # path(s) to A
-        img2_path,          # path to B
-        buffer_m,           # SH buffer in meters
-        pixel_size_m,       # pixel spacing in meters
+        best_raw_config,
+        best_crf_config,
+        cfg.MODEL_NAME,
+        getattr(cfg, "SOURCE_TILES", None) or cfg.SOURCE_TILE,
+        img2_path,
+        buffer_m,
+        pixel_size_m,
         shadow_cfg=shadow_cfg,
         extra_settings={
             "tile_size": tile_size,
@@ -550,7 +387,166 @@ def main():
             "neg_alpha": getattr(cfg, "NEG_ALPHA", 1.0),
             "pos_frac_thresh": getattr(cfg, "POS_FRAC_THRESH", 0.1),
         },
+        best_settings_path=os.path.join(os.path.dirname(cfg.BEST_SETTINGS_PATH), f"best_settings_{base_name_b}.yml"),
     )
+
+    return shadow_mask, img2_path
+
+
+def main():
+    """
+    Full segmentation pipeline:
+         • Build banks from Image A
+         • kNN transfer to Image B
+         • Threshold selection
+         • CRF refinement
+         • Shadow filtering
+         • Export diagnostics + shapefiles
+    """
+
+    setup_logging(getattr(cfg, "LOG_PATH", None))
+    t0_main = time_start()
+    model_name = cfg.MODEL_NAME
+
+    # ------------------------------------------------------------
+    # Init DINOv3 model & processor
+    # ------------------------------------------------------------
+    model, processor, device = init_model(model_name)
+    ps = getattr(cfg, "PATCH_SIZE", model.config.patch_size)
+    tile_size = getattr(cfg, "TILE_SIZE", 1024)
+    stride = getattr(cfg, "STRIDE", tile_size)
+
+    # ------------------------------------------------------------
+    # Resolve paths to imagery + SH_2022 + GT vector labels
+    # ------------------------------------------------------------
+    source_tile_default = cfg.SOURCE_TILE
+    target_tile = cfg.TARGET_TILE
+    source_label_raster = cfg.SOURCE_LABEL_RASTER
+    gt_vector_paths = getattr(cfg, "EVAL_GT_VECTORS", None) or cfg.EVAL_GT_VECTOR
+
+    # ------------------------------------------------------------
+    # Resolve one or more labeled source images (Image A list)
+    # ------------------------------------------------------------
+    img_a_paths = getattr(cfg, "SOURCE_TILES", None) or [source_tile_default]
+    lab_a_paths = [source_label_raster] * len(img_a_paths)
+
+    context_radius = int(getattr(cfg, "FEAT_CONTEXT_RADIUS", 0) or 0)
+
+    # ------------------------------------------------------------
+    # Resolve B tile paths and GT labels (union of GT vectors)
+    # ------------------------------------------------------------
+    img_b_paths = getattr(cfg, "TARGET_TILES", None) or [target_tile]
+    gt_vector_paths = getattr(cfg, "EVAL_GT_VECTORS", None) or cfg.EVAL_GT_VECTOR
+
+    # ------------------------------------------------------------
+    # Output organization + feature caching
+    # ------------------------------------------------------------
+    output_dir = getattr(cfg, "OUTPUT_DIR", "output")
+    shape_dir = os.path.join(output_dir, "shapes")
+    os.makedirs(cfg.PLOT_DIR, exist_ok=True)
+    os.makedirs(shape_dir, exist_ok=True)
+    feature_dir = cfg.FEATURE_DIR
+    os.makedirs(feature_dir, exist_ok=True)
+
+    image_id_a_list = [os.path.splitext(os.path.basename(p))[0] for p in img_a_paths]
+
+    # ------------------------------------------------------------
+    # Build DINOv3 positive/negative banks from one or more Image A sources
+    # ------------------------------------------------------------
+    pos_banks = []
+    neg_banks = []
+    for img_a_path, lab_a_path, image_id_a in zip(img_a_paths, lab_a_paths, image_id_a_list, strict=True):
+        logger.info("source A: %s (labels: %s)", img_a_path, lab_a_path)
+        img_a = load_dop20_image(img_a_path)
+        labels_A = reproject_labels_to_image(img_a_path, lab_a_path)
+
+        pos_bank_i, neg_bank_i = build_banks_single_scale(
+            img_a,                    # img_a: RGB array
+            labels_A,                 # SH labels on A (reprojected)
+            model,                    # DINO model
+            processor,                # processor
+            device,                   # GPU/CPU device
+            ps,                       # patch size
+            tile_size,                # tiling
+            stride,                   # overlap
+            getattr(cfg, "POS_FRAC_THRESH", 0.1),
+            None,
+            feature_dir,
+            image_id_a,
+            cfg.BANK_CACHE_DIR,
+            context_radius=context_radius,
+        )
+        pos_banks.append(pos_bank_i)
+        if neg_bank_i is not None and len(neg_bank_i) > 0:
+            neg_banks.append(neg_bank_i)
+
+    pos_bank = np.concatenate(pos_banks, axis=0)
+    neg_bank = np.concatenate(neg_banks, axis=0) if neg_banks else None
+    logger.info("combined banks: pos=%s, neg=%s", len(pos_bank), 0 if neg_bank is None else len(neg_bank))
+
+    # ------------------------------------------------------------
+    # Build XGBoost training data once from Image A sources
+    # ------------------------------------------------------------
+    X_list = []
+    y_list = []
+    for img_a_path, lab_a_path, image_id_a in zip(img_a_paths, lab_a_paths, image_id_a_list, strict=True):
+        img_a = load_dop20_image(img_a_path)
+        labels_A = reproject_labels_to_image(img_a_path, lab_a_path)
+        X_i, y_i = build_xgb_dataset(
+            img_a,
+            labels_A,
+            ps,
+            tile_size,
+            stride,
+            feature_dir,
+            image_id_a,
+            pos_frac=cfg.POS_FRAC_THRESH,
+            max_neg=getattr(cfg, "MAX_NEG_BANK", 8000),
+            context_radius=context_radius,
+        )
+        X_list.append(X_i)
+        y_list.append(y_i)
+    X = np.vstack(X_list) if X_list else np.empty((0, 0), dtype=np.float32)
+    y = np.concatenate(y_list) if y_list else np.empty((0,), dtype=np.float32)
+
+    # ------------------------------------------------------------
+    # Run per-B tile processing + unified shapefile
+    # ------------------------------------------------------------
+    masks_for_union = []
+    for b_path in img_b_paths:
+        shadow_mask, ref_path = process_b_tile(
+            b_path,
+            gt_vector_paths,
+            model,
+            processor,
+            device,
+            pos_bank,
+            neg_bank,
+            X,
+            y,
+            ps,
+            tile_size,
+            stride,
+            feature_dir,
+            shape_dir,
+            context_radius,
+        )
+        masks_for_union.append((shadow_mask, ref_path))
+
+    if masks_for_union:
+        export_masks_to_shapefile_union(
+            masks_for_union,
+            os.path.join(shape_dir, "pred_mask_best_shadow_merged.shp")
+        )
+
+    # ------------------------------------------------------------
+    # Consolidate tile-level feature files (.npy) → one per image
+    # ------------------------------------------------------------
+    for image_id_a in image_id_a_list:
+        consolidate_features_for_image(feature_dir, image_id_a)
+    for b_path in img_b_paths:
+        image_id_b = os.path.splitext(os.path.basename(b_path))[0]
+        consolidate_features_for_image(feature_dir, image_id_b)
 
     time_end("main (total)", t0_main)
 
