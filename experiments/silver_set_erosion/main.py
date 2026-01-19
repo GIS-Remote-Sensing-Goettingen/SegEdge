@@ -597,9 +597,30 @@ def main():
          • Export diagnostics + shapefiles
     """
 
-    setup_logging(getattr(cfg, "LOG_PATH", None))
     t0_main = time_start()
     model_name = cfg.MODEL_NAME
+
+    # ------------------------------------------------------------
+    # Output organization (one folder per run)
+    # ------------------------------------------------------------
+    output_root = getattr(cfg, "OUTPUT_DIR", "output")
+    os.makedirs(output_root, exist_ok=True)
+    existing = sorted(d for d in os.listdir(output_root) if d.startswith("run_"))
+    next_idx = 1
+    if existing:
+        try:
+            next_idx = max(int(d.split("_")[1]) for d in existing if d.split("_")[1].isdigit()) + 1
+        except ValueError:
+            next_idx = len(existing) + 1
+    run_dir = os.path.join(output_root, f"run_{next_idx:03d}")
+    plot_dir = os.path.join(run_dir, "plots")
+    shape_dir = os.path.join(run_dir, "shapes")
+    os.makedirs(plot_dir, exist_ok=True)
+    os.makedirs(shape_dir, exist_ok=True)
+    cfg.PLOT_DIR = plot_dir
+    cfg.BEST_SETTINGS_PATH = os.path.join(run_dir, "best_settings.yml")
+    cfg.LOG_PATH = os.path.join(run_dir, "run.log")
+    setup_logging(getattr(cfg, "LOG_PATH", None))
 
     # ------------------------------------------------------------
     # Init DINOv3 model & processor
@@ -635,12 +656,8 @@ def main():
     gt_vector_paths = cfg.EVAL_GT_VECTORS
 
     # ------------------------------------------------------------
-    # Output organization + feature caching
+    # Feature caching
     # ------------------------------------------------------------
-    output_dir = getattr(cfg, "OUTPUT_DIR", "output")
-    shape_dir = os.path.join(output_dir, "shapes")
-    os.makedirs(cfg.PLOT_DIR, exist_ok=True)
-    os.makedirs(shape_dir, exist_ok=True)
     feature_dir = cfg.FEATURE_DIR
     os.makedirs(feature_dir, exist_ok=True)
 
