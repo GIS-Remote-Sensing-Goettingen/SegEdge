@@ -8,7 +8,7 @@ import torch
 from skimage.transform import resize
 
 import config as cfg
-from experiments.silver_set_erosion.xdboost import (
+from xdboost import (
     build_xgb_dataset,
     train_xgb_classifier,
     hyperparam_search_xgb,
