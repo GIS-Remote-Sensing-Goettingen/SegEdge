@@ -50,7 +50,17 @@ def init_model(model_name: str):
     """Load DINOv3 backbone + processor on CPU/GPU with timing."""
     t0 = time_start()
     processor = AutoImageProcessor.from_pretrained(model_name)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        logger.info("CUDA_VISIBLE_DEVICES=%s", visible if visible else "<unset>")
+        device = torch.device("cuda:0")
+        try:
+            gpu_name = torch.cuda.get_device_name(device)
+            logger.info("Using GPU device: %s", gpu_name)
+        except Exception:
+            logger.info("Using GPU device: cuda:0")
+    else:
+        device = torch.device("cpu")
     model = AutoModel.from_pretrained(model_name)
     model.eval()
     model.to(device)

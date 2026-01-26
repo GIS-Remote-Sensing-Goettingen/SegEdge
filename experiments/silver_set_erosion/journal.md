@@ -20,3 +20,10 @@
 - Summary: Added tile-aware logging for validation tuning and holdout inference steps.
 - Files touched: `main.py`
 - Notes: Logs now include the tile path during loading, scoring, CRF, and shadow stages.
+
+## Change 4: GPU selection logging
+- Date: 2026-01-26
+- Author: Codex
+- Summary: Log CUDA_VISIBLE_DEVICES and GPU name; use cuda:0 within the visible set.
+- Files touched: `main.py`
+- Notes: This respects Slurm device assignment.
