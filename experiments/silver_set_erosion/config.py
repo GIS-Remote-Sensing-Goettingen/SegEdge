@@ -53,7 +53,7 @@ LOG_PATH = "output/run.log"
 # 2) Model + tiling
 # -----------------------------------------------------------------------------
 MODEL_NAME = "facebook/dinov3-vitl16-pretrain-sat493m"
-RESAMPLE_FACTOR = 3  # 3x downsample: 0.2 m/px -> 0.6 m/px
+RESAMPLE_FACTOR = 1  # 3x downsample: 0.2 m/px -> 0.6 m/px
 PATCH_SIZE = 16  # ViT patch size
 TILE_SIZE = 1024
 STRIDE = 512
