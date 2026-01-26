@@ -11,6 +11,7 @@ from features import (
     save_tile_features,
     tile_feature_path,
     add_local_context_mean,
+    load_tile_features_if_valid,
 )
 from timing_utils import time_start, time_end
 import config as cfg
@@ -56,6 +57,7 @@ def build_banks_single_scale(img_a: np.ndarray,
     cached_tiles = computed_tiles = 0
 
     labels_eroded = erosion((labels_a > 0).astype(bool), disk(2))
+    resample_factor = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
 
     for y, x, img_tile, lab_tile in tile_iterator(img_a, labels_eroded, tile_size, stride):
         img_c, lab_c, h_eff, w_eff = crop_to_multiple_of_ps(img_tile, lab_tile, ps)
@@ -66,10 +68,19 @@ def build_banks_single_scale(img_a: np.ndarray,
         hp = wp = None
 
         if feature_dir is not None and image_id is not None:
-            fpath = tile_feature_path(feature_dir, image_id, y, x)
-            if os.path.exists(fpath):
-                feats_tile = np.load(fpath)
-                hp, wp = feats_tile.shape[:2]
+            hp = h_eff // ps
+            wp = w_eff // ps
+            feats_tile = load_tile_features_if_valid(
+                feature_dir,
+                image_id,
+                y,
+                x,
+                expected_hp=hp,
+                expected_wp=wp,
+                ps=ps,
+                resample_factor=resample_factor,
+            )
+            if feats_tile is not None:
                 cached_tiles += 1
 
         if feats_tile is None:
@@ -78,7 +89,13 @@ def build_banks_single_scale(img_a: np.ndarray,
             )
             computed_tiles += 1
             if feature_dir is not None and image_id is not None:
-                save_tile_features(feats_tile, feature_dir, image_id, y, x)
+                meta = {
+                    "ps": ps,
+                    "resample_factor": resample_factor,
+                    "h_eff": h_eff,
+                    "w_eff": w_eff,
+                }
+                save_tile_features(feats_tile, feature_dir, image_id, y, x, meta=meta)
         if context_radius and context_radius > 0:
             feats_tile = add_local_context_mean(feats_tile, context_radius)
 

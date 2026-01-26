@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import logging
 
 import numpy as np
@@ -103,15 +104,79 @@ def tile_feature_path(feature_dir: str,
     return os.path.join(feature_dir, fname)
 
 
+def tile_feature_meta_path(feature_dir: str,
+                           image_id: str,
+                           y: int,
+                           x: int) -> str:
+    """Sidecar JSON path for feature metadata."""
+    fname = f"{image_id}_y{y}_x{x}_features.json"
+    return os.path.join(feature_dir, fname)
+
+
 def save_tile_features(feats_tile: np.ndarray,
                        feature_dir: str,
                        image_id: str,
                        y: int,
-                       x: int):
-    """Persist a tile's features to disk."""
+                       x: int,
+                       meta: dict | None = None):
+    """Persist a tile's features to disk (and optional metadata)."""
     os.makedirs(feature_dir, exist_ok=True)
     fpath = tile_feature_path(feature_dir, image_id, y, x)
     np.save(fpath, feats_tile.astype(np.float32))
+    if meta is not None:
+        mpath = tile_feature_meta_path(feature_dir, image_id, y, x)
+        with open(mpath, "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+
+
+def load_tile_features_if_valid(feature_dir: str,
+                                image_id: str,
+                                y: int,
+                                x: int,
+                                expected_hp: int,
+                                expected_wp: int,
+                                ps: int,
+                                resample_factor: int) -> np.ndarray | None:
+    """
+    Load cached features if valid. If metadata is missing or mismatched, delete cache and return None.
+    """
+    fpath = tile_feature_path(feature_dir, image_id, y, x)
+    if not os.path.exists(fpath):
+        return None
+    mpath = tile_feature_meta_path(feature_dir, image_id, y, x)
+    if not os.path.exists(mpath):
+        try:
+            os.remove(fpath)
+        except OSError:
+            pass
+        return None
+    try:
+        with open(mpath, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        try:
+            os.remove(fpath)
+        except OSError:
+            pass
+        return None
+
+    if meta.get("ps") != ps or meta.get("resample_factor") != resample_factor:
+        try:
+            os.remove(fpath)
+            os.remove(mpath)
+        except OSError:
+            pass
+        return None
+
+    feats = np.load(fpath)
+    if feats.shape[0] != expected_hp or feats.shape[1] != expected_wp:
+        try:
+            os.remove(fpath)
+            os.remove(mpath)
+        except OSError:
+            pass
+        return None
+    return feats
 
 
 def extract_patch_features_single_scale(image_hw3: np.ndarray,
@@ -167,6 +232,7 @@ def prefetch_features_single_scale_image(
     t0 = time_start()
     cache = {}
     cached_tiles = computed_tiles = skipped_tiles = 0
+    resample_factor = int(getattr(__import__("config"), "RESAMPLE_FACTOR", 1) or 1)
     for y, x, img_tile, _ in tile_iterator(img_hw3, None, tile_size, stride):
         img_c, _, h_eff, w_eff = crop_to_multiple_of_ps(img_tile, None, ps)
         if h_eff < ps or w_eff < ps:
@@ -175,10 +241,19 @@ def prefetch_features_single_scale_image(
         feats_tile = None
         hp = wp = None
         if feature_dir is not None and image_id is not None:
-            fpath = tile_feature_path(feature_dir, image_id, y, x)
-            if os.path.exists(fpath):
-                feats_tile = np.load(fpath)
-                hp, wp = feats_tile.shape[:2]
+            hp = h_eff // ps
+            wp = w_eff // ps
+            feats_tile = load_tile_features_if_valid(
+                feature_dir,
+                image_id,
+                y,
+                x,
+                expected_hp=hp,
+                expected_wp=wp,
+                ps=ps,
+                resample_factor=resample_factor,
+            )
+            if feats_tile is not None:
                 cached_tiles += 1
         if feats_tile is None:
             feats_tile, hp, wp = extract_patch_features_single_scale(
@@ -186,7 +261,13 @@ def prefetch_features_single_scale_image(
             )
             computed_tiles += 1
             if feature_dir is not None and image_id is not None:
-                save_tile_features(feats_tile, feature_dir, image_id, y, x)
+                meta = {
+                    "ps": ps,
+                    "resample_factor": resample_factor,
+                    "h_eff": h_eff,
+                    "w_eff": w_eff,
+                }
+                save_tile_features(feats_tile, feature_dir, image_id, y, x, meta=meta)
         cache[(y, x)] = {"feats": feats_tile, "h_eff": h_eff, "w_eff": w_eff, "hp": hp, "wp": wp}
     time_end("prefetch_features_single_scale_image", t0)
     logger.info("prefetch tiles=%s (cached=%s, computed=%s, skipped=%s)", len(cache), cached_tiles, computed_tiles, skipped_tiles)

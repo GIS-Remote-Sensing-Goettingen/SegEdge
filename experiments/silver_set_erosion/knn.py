@@ -13,6 +13,7 @@ from features import (
     tile_feature_path,
     save_tile_features,
     add_local_context_mean,
+    load_tile_features_if_valid,
 )
 from metrics_utils import compute_metrics_batch_gpu, compute_metrics_batch_cpu
 from timing_utils import time_start, time_end, DEBUG_TIMING
@@ -63,6 +64,7 @@ def zero_shot_knn_single_scale_B_with_saliency(
     saliency_full = np.zeros((h_full, w_full), dtype=np.float32)
     weight_full = np.zeros((h_full, w_full), dtype=np.float32)
     cached_tiles = computed_tiles = 0
+    resample_factor = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
 
     pos_bank_t = torch.from_numpy(pos_bank.astype(np.float32)).to(device)
     pos_bank_t_half = pos_bank_t.half() if use_fp16_matmul and device.type == "cuda" else None
@@ -112,10 +114,19 @@ def zero_shot_knn_single_scale_B_with_saliency(
             feats_tile = None
             hp = wp = None
             if feature_dir is not None and image_id is not None:
-                fpath = tile_feature_path(feature_dir, image_id, y, x)
-                if os.path.exists(fpath):
-                    feats_tile = np.load(fpath)
-                    hp, wp = feats_tile.shape[:2]
+                hp = h_eff // ps
+                wp = w_eff // ps
+                feats_tile = load_tile_features_if_valid(
+                    feature_dir,
+                    image_id,
+                    y,
+                    x,
+                    expected_hp=hp,
+                    expected_wp=wp,
+                    ps=ps,
+                    resample_factor=resample_factor,
+                )
+                if feats_tile is not None:
                     cached_tiles += 1
             if feats_tile is None:
                 feats_tile, hp, wp = extract_patch_features_single_scale(
@@ -123,7 +134,13 @@ def zero_shot_knn_single_scale_B_with_saliency(
                 )
                 computed_tiles += 1
                 if feature_dir is not None and image_id is not None:
-                    save_tile_features(feats_tile, feature_dir, image_id, y, x)
+                    meta = {
+                        "ps": ps,
+                        "resample_factor": resample_factor,
+                        "h_eff": h_eff,
+                        "w_eff": w_eff,
+                    }
+                    save_tile_features(feats_tile, feature_dir, image_id, y, x, meta=meta)
 
         if context_radius and context_radius > 0:
             feats_tile = add_local_context_mean(feats_tile, context_radius)

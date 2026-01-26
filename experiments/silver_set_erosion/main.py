@@ -61,9 +61,10 @@ def init_model(model_name: str):
 def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
     """Load B tile, SH raster, GT (optional), and buffer mask."""
     t0_data = time_start()
-    img_b = load_dop20_image(img_path)
-    labels_sh = reproject_labels_to_image(img_path, cfg.SOURCE_LABEL_RASTER)
-    gt_mask = rasterize_vector_labels(gt_vector_paths, img_path) if gt_vector_paths else None
+    ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+    img_b = load_dop20_image(img_path, downsample_factor=ds)
+    labels_sh = reproject_labels_to_image(img_path, cfg.SOURCE_LABEL_RASTER, downsample_factor=ds)
+    gt_mask = rasterize_vector_labels(gt_vector_paths, img_path, downsample_factor=ds) if gt_vector_paths else None
     time_end("data_loading_and_reprojection", t0_data)
 
     if gt_mask is not None:
@@ -72,6 +73,7 @@ def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
 
     with __import__("rasterio").open(img_path) as src:
         pixel_size_m = abs(src.transform.a)
+    pixel_size_m = pixel_size_m * ds
     buffer_m = cfg.BUFFER_M
     buffer_pixels = int(round(buffer_m / pixel_size_m))
     logger.info("pixel_size=%.3f m, buffer_m=%s, buffer_pixels=%s", pixel_size_m, buffer_m, buffer_pixels)
@@ -672,8 +674,9 @@ def main():
     neg_banks = []
     for img_a_path, lab_a_path, image_id_a in zip(img_a_paths, lab_a_paths, image_id_a_list, strict=True):
         logger.info("source A: %s (labels: %s)", img_a_path, lab_a_path)
-        img_a = load_dop20_image(img_a_path)
-        labels_A = reproject_labels_to_image(img_a_path, lab_a_path)
+        ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+        img_a = load_dop20_image(img_a_path, downsample_factor=ds)
+        labels_A = reproject_labels_to_image(img_a_path, lab_a_path, downsample_factor=ds)
 
         pos_bank_i, neg_bank_i = build_banks_single_scale(
             img_a,                    # img_a: RGB array
@@ -705,8 +708,9 @@ def main():
     X_list = []
     y_list = []
     for img_a_path, lab_a_path, image_id_a in zip(img_a_paths, lab_a_paths, image_id_a_list, strict=True):
-        img_a = load_dop20_image(img_a_path)
-        labels_A = reproject_labels_to_image(img_a_path, lab_a_path)
+        ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+        img_a = load_dop20_image(img_a_path, downsample_factor=ds)
+        labels_A = reproject_labels_to_image(img_a_path, lab_a_path, downsample_factor=ds)
         X_i, y_i = build_xgb_dataset(
             img_a,
             labels_A,

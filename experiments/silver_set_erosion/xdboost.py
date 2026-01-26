@@ -10,6 +10,7 @@ from features import (
     labels_to_patch_masks,
     tile_feature_path,
     add_local_context_mean,
+    load_tile_features_if_valid,
 )
 from metrics_utils import compute_metrics_batch_cpu, compute_metrics_batch_gpu
 
@@ -48,6 +49,7 @@ def build_xgb_dataset(
     """
     X_pos, X_neg = [], []
     missing_feature_tiles = 0
+    resample_factor = int(getattr(__import__("config"), "RESAMPLE_FACTOR", 1) or 1)
     for y, x, img_tile, lab_tile in tile_iterator(img, labels, tile_size, stride):
         img_c, lab_c, h_eff, w_eff = crop_to_multiple_of_ps(img_tile, lab_tile, ps)
         if h_eff < ps or w_eff < ps:
@@ -56,10 +58,23 @@ def build_xgb_dataset(
         if not os.path.exists(fpath):
             missing_feature_tiles += 1
             continue
-        feats_tile = np.load(fpath)  # produced by banks/prefetch stages
+        hp = h_eff // ps
+        wp = w_eff // ps
+        feats_tile = load_tile_features_if_valid(
+            feature_dir,
+            image_id,
+            y,
+            x,
+            expected_hp=hp,
+            expected_wp=wp,
+            ps=ps,
+            resample_factor=resample_factor,
+        )
+        if feats_tile is None:
+            missing_feature_tiles += 1
+            continue
         if context_radius and context_radius > 0:
             feats_tile = add_local_context_mean(feats_tile, int(context_radius))
-        hp, wp = feats_tile.shape[:2]
         pos_mask, neg_mask = labels_to_patch_masks(lab_c, hp, wp, pos_frac_thresh=pos_frac)
         if pos_mask.any():
             X_pos.append(feats_tile[pos_mask])

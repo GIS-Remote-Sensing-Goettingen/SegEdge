@@ -23,11 +23,22 @@ except ImportError:
     _HAS_CV2 = False
 
 
-def load_dop20_image(path: str) -> np.ndarray:
-    """Load a GeoTIFF orthophoto and return an HxWx3 RGB array (clips to first 3 bands)."""
+def load_dop20_image(path: str, downsample_factor: int = 1) -> np.ndarray:
+    """
+    Load a GeoTIFF orthophoto and return an HxWx3 RGB array (clips to first 3 bands).
+    Optionally downsample by an integer factor (nearest for labels, bilinear for imagery).
+    """
     t0 = time_start()
     with rasterio.open(path) as src:
-        arr = src.read()
+        if downsample_factor > 1:
+            out_h = src.height // downsample_factor
+            out_w = src.width // downsample_factor
+            arr = src.read(
+                out_shape=(src.count, out_h, out_w),
+                resampling=Resampling.bilinear,
+            )
+        else:
+            arr = src.read()
     img = reshape_as_image(arr)
     if img.shape[2] > 3:
         img = img[:, :, :3]
@@ -35,10 +46,21 @@ def load_dop20_image(path: str) -> np.ndarray:
     return img
 
 
-def reproject_labels_to_image(ref_img_path: str, labels_path: str) -> np.ndarray:
+def reproject_labels_to_image(ref_img_path: str, labels_path: str, downsample_factor: int = 1) -> np.ndarray:
     """Reproject a raster label map onto the grid/CRS of a reference image using nearest neighbor."""
     t0 = time_start()
     with rasterio.open(ref_img_path) as ref, rasterio.open(labels_path) as src:
+        if downsample_factor > 1:
+            dst_width = ref.width // downsample_factor
+            dst_height = ref.height // downsample_factor
+            dst_transform = ref.transform * ref.transform.scale(
+                ref.width / dst_width,
+                ref.height / dst_height,
+            )
+        else:
+            dst_width = ref.width
+            dst_height = ref.height
+            dst_transform = ref.transform
         dst_meta = ref.meta.copy()
         dst_meta.update(dtype=src.dtypes[0], count=src.count)
         memfile = rasterio.io.MemoryFile()
@@ -49,10 +71,10 @@ def reproject_labels_to_image(ref_img_path: str, labels_path: str) -> np.ndarray
                     destination=rasterio.band(dst, i),
                     src_transform=src.transform,
                     src_crs=src.crs,
-                    dst_transform=ref.transform,
+                    dst_transform=dst_transform,
                     dst_crs=ref.crs,
-                    dst_width=ref.width,
-                    dst_height=ref.height,
+                    dst_width=dst_width,
+                    dst_height=dst_height,
                     resampling=Resampling.nearest,
                 )
             labels_arr = dst.read()
@@ -63,7 +85,8 @@ def reproject_labels_to_image(ref_img_path: str, labels_path: str) -> np.ndarray
 
 def rasterize_vector_labels(vector_path: str | list[str],
                             ref_raster_path: str,
-                            burn_value: int = 1) -> np.ndarray:
+                            burn_value: int = 1,
+                            downsample_factor: int = 1) -> np.ndarray:
     """
     Rasterize one or more vector layers onto the reference raster grid and union them.
 
@@ -73,8 +96,15 @@ def rasterize_vector_labels(vector_path: str | list[str],
     t0 = time_start()
     vector_paths = vector_path if isinstance(vector_path, list) else [vector_path]
     with rasterio.open(ref_raster_path) as src:
-        out_shape = (src.height, src.width)
-        transform = src.transform
+        if downsample_factor > 1:
+            out_shape = (src.height // downsample_factor, src.width // downsample_factor)
+            transform = src.transform * src.transform.scale(
+                src.width / out_shape[1],
+                src.height / out_shape[0],
+            )
+        else:
+            out_shape = (src.height, src.width)
+            transform = src.transform
         raster_crs = src.crs
     gt_mask = np.zeros(out_shape, dtype="uint8")
 
