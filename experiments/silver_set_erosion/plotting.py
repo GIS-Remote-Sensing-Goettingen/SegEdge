@@ -7,14 +7,12 @@ logger = logging.getLogger(__name__)
 
 def save_plot(img_b, gt_mask_B, mask_raw_best, best_raw_config, best_crf_mask, best_crf_config, thr_center_for_crf, plot_dir, image_id_b, best_shadow=None, labels_sh=None):
     """Save comparison figure (RGB, GT, raw, CRF, optional shadow/labels) to plot_dir."""
-    # Layout: rows=2; cols depend on optional panels.
     show_labels = labels_sh is not None
-    cols = 3 if best_shadow is not None else 2
-    if show_labels:
-        cols += 1
+    show_shadow = best_shadow is not None
+    cols = 3 if (show_labels or show_shadow) else 2
     fig, axs = plt.subplots(2, cols, figsize=(8 * cols, 12))
-    if cols == 2:
-        axs = np.array([[axs[0], axs[1]], [axs[2], axs[3]]]) if axs.ndim == 1 else axs
+    if cols == 2 and axs.ndim == 1:
+        axs = np.array([[axs[0], axs[1]], [axs[2], axs[3]]])
     axs[0, 0].imshow(img_b)
     axs[0, 0].set_title("Image B (RGB)")
     axs[0, 0].axis("off")
@@ -23,12 +21,10 @@ def save_plot(img_b, gt_mask_B, mask_raw_best, best_raw_config, best_crf_mask, b
     axs[0, 1].set_title("Ground truth (union)")
     axs[0, 1].axis("off")
 
-    col_idx = 2
     if show_labels:
         axs[0, 2].imshow(labels_sh > 0, cmap="gray")
         axs[0, 2].set_title("SOURCE_LABEL_RASTER (reprojected)")
         axs[0, 2].axis("off")
-        col_idx = 3
 
     overlay_raw = img_b.copy()
     overlay_raw[mask_raw_best] = (0.5 * overlay_raw[mask_raw_best] + 0.5 * np.array([0, 255, 0])).astype(overlay_raw.dtype)
@@ -48,19 +44,19 @@ def save_plot(img_b, gt_mask_B, mask_raw_best, best_raw_config, best_crf_mask, b
     )
     axs[1, 1].axis("off")
 
-    if best_shadow is not None:
+    if show_shadow:
         shadow_mask = best_shadow["mask"]
         shadow_cfg = best_shadow["cfg"]
         overlay_shadow = img_b.copy()
         overlay_shadow[shadow_mask] = (
             0.5 * overlay_shadow[shadow_mask] + 0.5 * np.array([255, 255, 0])
         ).astype(overlay_shadow.dtype)
-        axs[1, col_idx - 1].imshow(overlay_shadow)
-        axs[1, col_idx - 1].set_title(
+        axs[1, 2].imshow(overlay_shadow)
+        axs[1, 2].set_title(
             f"Shadow filter w={shadow_cfg['weights']}, thr={shadow_cfg['threshold']}\n"
             f"IoU={shadow_cfg['iou']:.3f}, F1={shadow_cfg['f1']:.3f}"
         )
-        axs[1, col_idx - 1].axis("off")
+        axs[1, 2].axis("off")
 
     plt.tight_layout()
     os.makedirs(plot_dir, exist_ok=True)

@@ -6,6 +6,7 @@
 #SBATCH --partition=scc-gpu
 #SBATCH -G A100:1
 #SBATCH --cpus-per-task=16
+#SBATCH --time=00:30:00
 
 set -euo pipefail
 

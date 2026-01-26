@@ -48,3 +48,9 @@
 - Summary: Lowered POS_FRAC_THRESH and added BANK_EROSION_RADIUS to preserve thin positives after resampling.
 - Files touched: `config.py`, `banks.py`
 - Notes: Use BANK_EROSION_RADIUS=0 for 0.6m/px runs.
+
+## Change 8: Plot layout cleanup
+- Date: 2026-01-26
+- Author: Codex
+- Summary: Fixed save_plot layout to avoid empty panels by using a 2x3 grid when labels or shadow are present.
+- Files touched: `plotting.py`
