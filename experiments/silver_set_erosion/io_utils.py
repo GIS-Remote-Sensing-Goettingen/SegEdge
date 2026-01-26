@@ -11,6 +11,7 @@ from shapely.geometry import shape, mapping
 from shapely.ops import transform as shp_transform
 from pyproj import Transformer
 from skimage.morphology import dilation, disk
+from skimage.transform import resize
 
 from timing_utils import time_start, time_end, DEBUG_TIMING, DEBUG_TIMING_VERBOSE
 import config as cfg
@@ -62,7 +63,13 @@ def reproject_labels_to_image(ref_img_path: str, labels_path: str, downsample_fa
             dst_height = ref.height
             dst_transform = ref.transform
         dst_meta = ref.meta.copy()
-        dst_meta.update(dtype=src.dtypes[0], count=src.count)
+        dst_meta.update(
+            dtype=src.dtypes[0],
+            count=src.count,
+            width=dst_width,
+            height=dst_height,
+            transform=dst_transform,
+        )
         memfile = rasterio.io.MemoryFile()
         with memfile.open(**dst_meta) as dst:
             for i in range(1, src.count + 1):
@@ -79,6 +86,21 @@ def reproject_labels_to_image(ref_img_path: str, labels_path: str, downsample_fa
                 )
             labels_arr = dst.read()
     labels_2d = labels_arr[0]
+    expected_shape = (dst_height, dst_width)
+    if labels_2d.shape != expected_shape:
+        logger.warning(
+            "labels raster shape %s != expected %s for %s; resizing to match",
+            labels_2d.shape,
+            expected_shape,
+            labels_path,
+        )
+        labels_2d = resize(
+            labels_2d,
+            expected_shape,
+            order=0,
+            preserve_range=True,
+            anti_aliasing=False,
+        ).astype(labels_2d.dtype)
     time_end(f"reproject_labels_to_image[{os.path.basename(labels_path)} -> {os.path.basename(ref_img_path)}]", t0)
     return labels_2d
 

@@ -66,3 +66,9 @@
 - Author: Codex
 - Summary: Skip source tiles with zero XGB positives and error if the combined dataset is empty.
 - Files touched: `xdboost.py`, `main.py`
+
+## Change 11: Mask shape alignment guard
+- Date: 2026-01-26
+- Author: Codex
+- Summary: Added safety resizing when reprojected labels or GT masks do not match the downsampled image shape.
+- Files touched: `io_utils.py`, `main.py`

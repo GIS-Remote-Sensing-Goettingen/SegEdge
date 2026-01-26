@@ -77,6 +77,25 @@ def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
     labels_sh = reproject_labels_to_image(img_path, cfg.SOURCE_LABEL_RASTER, downsample_factor=ds)
     gt_mask = rasterize_vector_labels(gt_vector_paths, img_path, downsample_factor=ds) if gt_vector_paths else None
     time_end("data_loading_and_reprojection", t0_data)
+    target_shape = img_b.shape[:2]
+    if labels_sh.shape != target_shape:
+        logger.warning("labels_sh shape %s != image shape %s; resizing to match", labels_sh.shape, target_shape)
+        labels_sh = resize(
+            labels_sh,
+            target_shape,
+            order=0,
+            preserve_range=True,
+            anti_aliasing=False,
+        ).astype(labels_sh.dtype)
+    if gt_mask is not None and gt_mask.shape != target_shape:
+        logger.warning("gt_mask shape %s != image shape %s; resizing to match", gt_mask.shape, target_shape)
+        gt_mask = resize(
+            gt_mask,
+            target_shape,
+            order=0,
+            preserve_range=True,
+            anti_aliasing=False,
+        ).astype(gt_mask.dtype)
 
     if gt_mask is not None:
         logger.debug("GT positives on B: %s", gt_mask.sum())
