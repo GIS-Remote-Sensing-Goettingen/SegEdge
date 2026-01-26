@@ -89,10 +89,11 @@ def build_xgb_dataset(
         )
 
     if not X_pos:
-        raise ValueError(
-            f"build_xgb_dataset produced no positive samples for image_id={image_id}. "
-            "Verify labels, POS_FRAC_THRESH, and that feature tiles exist in FEATURE_DIR."
+        logger.warning(
+            "build_xgb_dataset produced no positive samples for image_id=%s; skipping this source tile",
+            image_id,
         )
+        return np.empty((0, 0), dtype=np.float32), np.empty((0,), dtype=np.float32)
 
     X_pos = np.concatenate(X_pos, axis=0)
     X_neg = np.concatenate(X_neg, axis=0) if X_neg else np.empty((0, X_pos.shape[1]))

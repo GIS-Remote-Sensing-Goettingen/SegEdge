@@ -60,3 +60,9 @@
 - Author: Codex
 - Summary: Skip source tiles with zero positives instead of aborting the run.
 - Files touched: `banks.py`, `main.py`
+
+## Change 10: Skip empty XGB tiles
+- Date: 2026-01-26
+- Author: Codex
+- Summary: Skip source tiles with zero XGB positives and error if the combined dataset is empty.
+- Files touched: `xdboost.py`, `main.py`

@@ -743,10 +743,13 @@ def main():
             max_neg=getattr(cfg, "MAX_NEG_BANK", 8000),
             context_radius=context_radius,
         )
-        X_list.append(X_i)
-        y_list.append(y_i)
+        if X_i.size > 0 and y_i.size > 0:
+            X_list.append(X_i)
+            y_list.append(y_i)
     X = np.vstack(X_list) if X_list else np.empty((0, 0), dtype=np.float32)
     y = np.concatenate(y_list) if y_list else np.empty((0,), dtype=np.float32)
+    if X.size == 0 or y.size == 0:
+        raise ValueError("XGBoost dataset is empty; check SOURCE_TILES and labels")
 
     # ------------------------------------------------------------
     # Tune on validation tile, then infer on holdout tiles
