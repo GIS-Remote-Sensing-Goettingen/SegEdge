@@ -27,3 +27,17 @@
 - Summary: Log CUDA_VISIBLE_DEVICES and GPU name; use cuda:0 within the visible set.
 - Files touched: `main.py`
 - Notes: This respects Slurm device assignment.
+
+## Change 5: CRF worker cap
+- Date: 2026-01-26
+- Author: Codex
+- Summary: Set CRF_NUM_WORKERS to 16 for safer multi-core usage.
+- Files touched: `config.py`
+- Notes: Adjust with SLURM CPU allocation if needed.
+
+## Change 6: Slurm CPU allocation
+- Date: 2026-01-26
+- Author: Codex
+- Summary: Added --cpus-per-task=16 to the Slurm script to match CRF workers.
+- Files touched: `silver_set.sh`
+- Notes: Keep in sync with CRF_NUM_WORKERS for best utilization.
