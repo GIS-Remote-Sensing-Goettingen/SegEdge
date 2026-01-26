@@ -4,7 +4,7 @@
 #SBATCH --error=segmentation_%j.err
 #SBATCH --mem=128G
 #SBATCH --partition=scc-gpu
-#SBATCH -G A100:1
+#SBATCH -G H100:1
 #SBATCH --cpus-per-task=16
 
 set -euo pipefail
