@@ -60,6 +60,7 @@ def init_model(model_name: str):
 
 def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
     """Load B tile, SH raster, GT (optional), and buffer mask."""
+    logger.info("loading tile: %s", img_path)
     t0_data = time_start()
     ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
     img_b = load_dop20_image(img_path, downsample_factor=ds)
@@ -76,7 +77,7 @@ def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
     pixel_size_m = pixel_size_m * ds
     buffer_m = cfg.BUFFER_M
     buffer_pixels = int(round(buffer_m / pixel_size_m))
-    logger.info("pixel_size=%.3f m, buffer_m=%s, buffer_pixels=%s", pixel_size_m, buffer_m, buffer_pixels)
+    logger.info("tile=%s pixel_size=%.3f m, buffer_m=%s, buffer_pixels=%s", img_path, pixel_size_m, buffer_m, buffer_pixels)
 
     sh_buffer_mask = build_sh_buffer_mask(labels_sh, buffer_pixels)
     if gt_mask is not None and getattr(cfg, "CLIP_GT_TO_BUFFER", False):
@@ -109,6 +110,7 @@ def tune_on_validation_multi(
 
     val_contexts = []
     for val_path in val_paths:
+        logger.info("tune: preparing validation tile %s", val_path)
         img_b, labels_sh, gt_mask_B, gt_mask_eval, sh_buffer_mask, buffer_m, pixel_size_m = load_b_tile_context(
             val_path, gt_vector_paths
         )
@@ -139,6 +141,7 @@ def tune_on_validation_multi(
     for k in cfg.K_VALUES:
         iou_by_thr = {thr: [] for thr in cfg.THRESHOLDS}
         for ctx in val_contexts:
+            logger.info("tune: kNN scoring on %s (k=%s)", ctx["path"], k)
             score_full, _ = zero_shot_knn_single_scale_B_with_saliency(
                 img_b=ctx["img_b"],
                 pos_bank=pos_bank,
@@ -218,6 +221,7 @@ def tune_on_validation_multi(
 
         iou_by_thr = {thr: [] for thr in cfg.THRESHOLDS}
         for ctx in val_contexts:
+            logger.info("tune: XGB scoring on %s", ctx["path"])
             score_full = xgb_score_image_b(
                 ctx["img_b"],
                 bst,
@@ -265,6 +269,7 @@ def tune_on_validation_multi(
     for cand in crf_candidates[:CRF_MAX_CONFIGS]:
         ious = []
         for ctx in val_contexts:
+            logger.info("tune: CRF scoring on %s", ctx["path"])
             if champion_source == "raw":
                 score_full, _ = zero_shot_knn_single_scale_B_with_saliency(
                     img_b=ctx["img_b"],
@@ -333,6 +338,7 @@ def tune_on_validation_multi(
     for weights in cfg.SHADOW_WEIGHT_SETS:
         iou_by_thr = {thr: [] for thr in cfg.SHADOW_THRESHOLDS}
         for ctx in val_contexts:
+            logger.info("tune: shadow scoring on %s", ctx["path"])
             if champion_source == "raw":
                 score_full, _ = zero_shot_knn_single_scale_B_with_saliency(
                     img_b=ctx["img_b"],
@@ -435,6 +441,7 @@ def infer_on_holdout(
     context_radius: int,
 ):
     """Inference-only on holdout tile using fixed settings from validation."""
+    logger.info("inference: holdout tile %s", holdout_path)
     img_b, labels_sh, gt_mask_B, gt_mask_eval, sh_buffer_mask, buffer_m, pixel_size_m = load_b_tile_context(holdout_path, gt_vector_paths)
     if gt_mask_eval is None:
         logger.warning("Holdout has no GT; metrics will be reported as 0.0.")

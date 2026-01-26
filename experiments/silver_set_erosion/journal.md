@@ -13,3 +13,10 @@
 - Summary: Added automatic cleanup of stale bank caches keyed by patch size, context radius, and resample factor.
 - Files touched: `banks.py`
 - Notes: Removes outdated `*_pos_bank.npy` / `*_neg_bank.npy` files for the same image_id.
+
+## Change 3: Tile-specific logging
+- Date: 2026-01-26
+- Author: Codex
+- Summary: Added tile-aware logging for validation tuning and holdout inference steps.
+- Files touched: `main.py`
+- Notes: Logs now include the tile path during loading, scoring, CRF, and shadow stages.
