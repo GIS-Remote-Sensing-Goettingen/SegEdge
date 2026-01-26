@@ -18,6 +18,29 @@ import config as cfg
 
 logger = logging.getLogger(__name__)
 
+def cleanup_bank_cache(bank_cache_dir: str,
+                       image_id: str,
+                       ps: int,
+                       context_radius: int,
+                       resample_factor: int):
+    """
+    Remove stale bank cache files for this image_id with mismatched settings.
+    """
+    if not os.path.isdir(bank_cache_dir):
+        return
+    prefix = f"{image_id}_"
+    keep_tag = f"{image_id}_ps{ps}_ctx{int(context_radius)}_rs{int(resample_factor)}"
+    for fname in os.listdir(bank_cache_dir):
+        if not fname.startswith(prefix):
+            continue
+        if keep_tag in fname:
+            continue
+        if fname.endswith("_pos_bank.npy") or fname.endswith("_neg_bank.npy"):
+            try:
+                os.remove(os.path.join(bank_cache_dir, fname))
+            except OSError:
+                pass
+
 def build_banks_single_scale(img_a: np.ndarray,
                              labels_a: np.ndarray,
                              model,
@@ -43,7 +66,9 @@ def build_banks_single_scale(img_a: np.ndarray,
 
     if bank_cache_dir is not None and image_id is not None:
         os.makedirs(bank_cache_dir, exist_ok=True)
-        cache_tag = f"{image_id}_ps{ps}_ctx{int(context_radius)}"
+        resample_factor = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+        cleanup_bank_cache(bank_cache_dir, image_id, ps, context_radius, resample_factor)
+        cache_tag = f"{image_id}_ps{ps}_ctx{int(context_radius)}_rs{resample_factor}"
         pos_cache_path = os.path.join(bank_cache_dir, f"{cache_tag}_pos_bank.npy")
         neg_cache_path = os.path.join(bank_cache_dir, f"{cache_tag}_neg_bank.npy")
         if os.path.exists(pos_cache_path):
@@ -128,7 +153,7 @@ def build_banks_single_scale(img_a: np.ndarray,
 
     if bank_cache_dir is not None and image_id is not None:
         os.makedirs(bank_cache_dir, exist_ok=True)
-        cache_tag = f"{image_id}_ps{ps}_ctx{int(context_radius)}"
+        cache_tag = f"{image_id}_ps{ps}_ctx{int(context_radius)}_rs{resample_factor}"
         pos_cache_path = os.path.join(bank_cache_dir, f"{cache_tag}_pos_bank.npy")
         neg_cache_path = os.path.join(bank_cache_dir, f"{cache_tag}_neg_bank.npy")
         np.save(pos_cache_path, pos_bank.astype(np.float32))
