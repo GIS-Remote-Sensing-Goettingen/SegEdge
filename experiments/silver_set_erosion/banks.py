@@ -81,7 +81,11 @@ def build_banks_single_scale(img_a: np.ndarray,
     pos_list, neg_list = [], []
     cached_tiles = computed_tiles = 0
 
-    labels_eroded = erosion((labels_a > 0).astype(bool), disk(2))
+    erosion_radius = int(getattr(cfg, "BANK_EROSION_RADIUS", 2) or 0)
+    if erosion_radius > 0:
+        labels_eroded = erosion((labels_a > 0).astype(bool), disk(erosion_radius))
+    else:
+        labels_eroded = (labels_a > 0).astype(bool)
     resample_factor = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
 
     for y, x, img_tile, lab_tile in tile_iterator(img_a, labels_eroded, tile_size, stride):

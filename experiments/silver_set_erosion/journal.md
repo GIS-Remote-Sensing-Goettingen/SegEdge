@@ -41,3 +41,10 @@
 - Summary: Added --cpus-per-task=16 to the Slurm script to match CRF workers.
 - Files touched: `silver_set.sh`
 - Notes: Keep in sync with CRF_NUM_WORKERS for best utilization.
+
+## Change 7: Bank labeling sensitivity
+- Date: 2026-01-26
+- Author: Codex
+- Summary: Lowered POS_FRAC_THRESH and added BANK_EROSION_RADIUS to preserve thin positives after resampling.
+- Files touched: `config.py`, `banks.py`
+- Notes: Use BANK_EROSION_RADIUS=0 for 0.6m/px runs.

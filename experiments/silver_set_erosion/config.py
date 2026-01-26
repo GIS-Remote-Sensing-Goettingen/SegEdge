@@ -60,11 +60,14 @@ STRIDE = 512
 BUFFER_M = 8.0  # spatial prior buffer (meters)
 
 # Patch labeling for banks.
-POS_FRAC_THRESH = 0.1  # patch is positive if FG fraction >= this
+POS_FRAC_THRESH = 0.05  # patch is positive if FG fraction >= this
 NEG_ALPHA = 1.0  # kNN negative bank weight
 
 # Optional patch-context smoothing (applies to banks, kNN, XGB).
 FEAT_CONTEXT_RADIUS = 0  # 0 disables; try 1 or 2 for more context
+
+# Bank label erosion (in pixels on the resampled grid). Set to 0 to keep thin positives.
+BANK_EROSION_RADIUS = 0
 
 # -----------------------------------------------------------------------------
 # 3) Scoring/search
