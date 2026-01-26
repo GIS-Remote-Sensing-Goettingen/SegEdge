@@ -54,3 +54,9 @@
 - Author: Codex
 - Summary: Fixed save_plot layout to avoid empty panels by using a 2x3 grid when labels or shadow are present.
 - Files touched: `plotting.py`
+
+## Change 9: Skip empty source tiles
+- Date: 2026-01-26
+- Author: Codex
+- Summary: Skip source tiles with zero positives instead of aborting the run.
+- Files touched: `banks.py`, `main.py`

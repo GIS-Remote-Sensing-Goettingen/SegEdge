@@ -137,7 +137,8 @@ def build_banks_single_scale(img_a: np.ndarray,
             neg_list.append(neg_feats_tile)
 
     if not pos_list:
-        raise ValueError("no positive patches found in Image A; check labels or pos_frac_thresh")
+        logger.warning("no positive patches found for image_id=%s; skipping this source tile", image_id)
+        return np.empty((0, 0), dtype=np.float32), None
 
     pos_bank = np.concatenate(pos_list, axis=0)
     neg_bank = np.concatenate(neg_list, axis=0) if neg_list else None

@@ -711,10 +711,13 @@ def main():
             cfg.BANK_CACHE_DIR,
             context_radius=context_radius,
         )
-        pos_banks.append(pos_bank_i)
+        if pos_bank_i.size > 0:
+            pos_banks.append(pos_bank_i)
         if neg_bank_i is not None and len(neg_bank_i) > 0:
             neg_banks.append(neg_bank_i)
 
+    if not pos_banks:
+        raise ValueError("no positive banks were built; check SOURCE_TILES and labels")
     pos_bank = np.concatenate(pos_banks, axis=0)
     neg_bank = np.concatenate(neg_banks, axis=0) if neg_banks else None
     logger.info("combined banks: pos=%s, neg=%s", len(pos_bank), 0 if neg_bank is None else len(neg_bank))
