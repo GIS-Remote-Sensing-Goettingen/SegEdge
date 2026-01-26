@@ -512,6 +512,8 @@ def infer_on_holdout(
         [shadow_cfg["weights"]],
         [shadow_cfg["threshold"]],
     )
+    shadow_metrics = compute_metrics(shadow_mask, gt_mask_eval)
+    shadow_cfg_full = {**shadow_cfg, **shadow_metrics}
 
     save_knn_xgb_gt_plot(
         img_b,
@@ -543,7 +545,7 @@ def infer_on_holdout(
         thr_center_for_crf,
         cfg.PLOT_DIR,
         image_id_b,
-        best_shadow={"cfg": shadow_cfg, "mask": shadow_mask},
+        best_shadow={"cfg": shadow_cfg_full, "mask": shadow_mask},
         labels_sh=labels_sh,
     )
 
@@ -571,7 +573,7 @@ def infer_on_holdout(
         holdout_path,
         buffer_m,
         pixel_size_m,
-        shadow_cfg=shadow_cfg,
+        shadow_cfg=shadow_cfg_full,
         extra_settings={
             "tile_size": tile_size,
             "stride": stride,
