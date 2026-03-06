@@ -12,6 +12,7 @@ set -euo pipefail
 module load miniforge3 gcc cuda
 # Activate env (allow override)
 source activate "${SEGEDGE_CONDA_ENV:-/mnt/vast-standard/home/davide.mattioli/u20330/myenv}"
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
 
@@ -31,7 +32,7 @@ python -u "./run_sr.py" \
   --input-tif "${INPUT_TIF}" \
   --output-dir "${OUTPUT_DIR}" \
   --factor 4 \
-  --window-size 128 128 \
+  --window-size 96 96 \
   --overlap 12 \
   --eliminate-border-px 2 \
   --gpus 0 \
